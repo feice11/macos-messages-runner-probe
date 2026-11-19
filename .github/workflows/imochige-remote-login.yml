@@ -61,8 +61,24 @@ jobs:
           IMOCHIGE_MAC_PASSWORD=$(openssl rand -hex 12)
           echo "::add-mask::$IMOCHIGE_MAC_PASSWORD"
           user=$(id -un)
-          sudo dscl . -passwd "/Users/$user" "$IMOCHIGE_MAC_PASSWORD" \
-            || sudo sysadminctl -resetPasswordFor "$user" -newPassword "$IMOCHIGE_MAC_PASSWORD" 2>&1 | tail -2
+          # The runner account holds a SecureToken, so `dscl -passwd` wants the unknown old
+          # password. On this SIP-disabled throwaway VM, rewrite the local shadow hash instead.
+          sudo python3 - "$user" "$IMOCHIGE_MAC_PASSWORD" <<'PY'
+          import hashlib, os, plistlib, sys
+          user, password = sys.argv[1], sys.argv[2]
+          path = f"/var/db/dslocal/nodes/Default/users/{user}.plist"
+          with open(path, "rb") as handle:
+              record = plistlib.load(handle)
+          salt, rounds = os.urandom(32), 45000
+          entropy = hashlib.pbkdf2_hmac("sha512", password.encode(), salt, rounds, 128)
+          shadow = {"SALTED-SHA512-PBKDF2": {"entropy": entropy, "iterations": rounds, "salt": salt}}
+          record["ShadowHashData"] = [plistlib.dumps(shadow, fmt=plistlib.FMT_BINARY)]
+          with open(path, "wb") as handle:
+              plistlib.dump(record, handle, fmt=plistlib.FMT_BINARY)
+          print("Shadow hash rewritten")
+          PY
+          sudo killall opendirectoryd || true
+          sleep 3
           if dscl . -authonly "$user" "$IMOCHIGE_MAC_PASSWORD"; then
             echo "Mac login password reset verified for $user"
             export IMOCHIGE_MAC_PASSWORD

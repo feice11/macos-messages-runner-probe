@@ -9,6 +9,7 @@ import Carbon
 import CoreGraphics
 import CryptoKit
 import Foundation
+import Vision
 
 setvbuf(stdout, nil, _IOLBF, 0)
 let env = ProcessInfo.processInfo.environment
@@ -364,14 +365,175 @@ func screenshot() -> [String: Any] {
     return ["ok": true, "jpeg": data.base64EncodedString()]
 }
 
+// MARK: - UU Remote login (QR code)
+
+func uuApp() -> NSRunningApplication? {
+    guard let path = env["UU_APP"] else { return nil }
+    return NSWorkspace.shared.runningApplications.first { $0.bundleURL?.path.hasPrefix(path) == true }
+}
+
+func uuWindows(_ app: NSRunningApplication) -> [(id: Int, frame: CGRect)] {
+    (CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? [])
+        .compactMap { window in
+            guard window[kCGWindowOwnerPID as String] as? Int32 == app.processIdentifier,
+                  window[kCGWindowLayer as String] as? Int == 0,
+                  let id = window[kCGWindowNumber as String] as? Int,
+                  let bounds = window[kCGWindowBounds as String] as? NSDictionary,
+                  let frame = CGRect(dictionaryRepresentation: bounds as CFDictionary),
+                  frame.width >= 200, frame.height >= 120 else { return nil }
+            return (id, frame)
+        }
+}
+
+func captureWindow(_ id: Int, to path: String) -> Bool {
+    let capture = Process()
+    capture.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+    capture.arguments = ["-x", "-o", "-l", String(id), path]
+    capture.standardError = FileHandle.nullDevice
+    do { try capture.run(); capture.waitUntilExit() } catch { return false }
+    return capture.terminationStatus == 0 && FileManager.default.fileExists(atPath: path)
+}
+
+let uuLoginLabels: Set<String> = ["登录", "立即登录", "点击登录", "登录账号", "去登录", "请登录", "登录/注册",
+                                  "注册/登录", "登录注册", "账号登录", "扫码登录", "signin", "login"]
+
+func launchUU() -> Bool {
+    guard let path = env["UU_APP"] else { return false }
+    let opener = Process()
+    opener.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+    opener.arguments = [path]
+    do { try opener.run(); opener.waitUntilExit() } catch { return false }
+    return opener.terminationStatus == 0
+}
+
+/// Hide every other app (System Settings keeps covering UU) and raise UU's windows.
+func bringUUToFront() -> [String: Any] {
+    if uuApp() == nil { _ = launchUU(); for _ in 0..<20 where uuApp() == nil { pump(0.5) } }
+    guard let app = uuApp() else { return ["ok": false, "error": "UU Remote is not running in this session"] }
+    let me = ProcessInfo.processInfo.processIdentifier
+    var hidden: [String] = []
+    for other in NSWorkspace.shared.runningApplications
+    where other.activationPolicy == .regular && other.processIdentifier != app.processIdentifier
+        && other.processIdentifier != me && !other.isHidden {
+        if other.hide() { hidden.append(other.localizedName ?? other.bundleIdentifier ?? "?") }
+    }
+    pump(0.5)
+    _ = launchUU()  // reopens a closed main window
+    _ = app.unhide()
+    _ = app.activate(options: [.activateAllWindows])
+    let root = AXUIElementCreateApplication(app.processIdentifier)
+    AXUIElementSetAttributeValue(root, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+    for window in attribute(root, kAXWindowsAttribute) as? [AXUIElement] ?? [] {
+        AXUIElementSetAttributeValue(window, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
+        AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+    }
+    pump(1.5)
+    let front = NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier
+    return ["ok": front, "hidden": hidden, "front": front,
+            "error": front ? "" : "UU did not become the frontmost app"]
+}
+
+/// Whether the topmost on-screen window at `point` belongs to UU.
+func pointHitsUU(_ point: CGPoint, _ app: NSRunningApplication) -> Bool {
+    let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+    let top = windows.first { window in
+        guard window[kCGWindowLayer as String] as? Int == 0,
+              (window[kCGWindowAlpha as String] as? Double ?? 1) > 0,
+              let bounds = window[kCGWindowBounds as String] as? NSDictionary,
+              let frame = CGRect(dictionaryRepresentation: bounds as CFDictionary) else { return false }
+        return frame.contains(point)
+    }
+    return top?[kCGWindowOwnerPID as String] as? Int32 == app.processIdentifier
+}
+
+func uuLogin() -> [String: Any] {
+    let front = bringUUToFront()
+    guard let app = uuApp() else { return front }
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("imochige-uu-\(UUID().uuidString)")
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let root = AXUIElementCreateApplication(app.processIdentifier)
+
+    var method = "none"
+    // 1) Accessibility button with a login title.
+    let buttons = descendants(root).filter { node in
+        let title = [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute]
+            .map { string(node, $0).lowercased().filter { !$0.isWhitespace } }
+        return role(node) == kAXButtonRole as String && title.contains { uuLoginLabels.contains($0) }
+    }
+    if buttons.count == 1, AXUIElementPerformAction(buttons[0], kAXPressAction as CFString) == .success {
+        method = "accessibility"
+    }
+    // 2) Text recognition on the window image, then a mouse click on the visible label.
+    var labels: [String] = []
+    if method == "none" {
+        var matches: [CGPoint] = []
+        for window in uuWindows(app) {
+            let image = dir.appendingPathComponent("ocr-\(window.id).png").path
+            guard captureWindow(window.id, to: image) else { continue }
+            let request = VNRecognizeTextRequest()
+            request.recognitionLanguages = ["zh-Hans", "en-US"]
+            try? VNImageRequestHandler(url: URL(fileURLWithPath: image)).perform([request])
+            for observation in request.results ?? [] {
+                guard let text = observation.topCandidates(1).first?.string else { continue }
+                let label = text.lowercased().filter { !$0.isWhitespace }.replacingOccurrences(of: "／", with: "/")
+                guard uuLoginLabels.contains(label) else { continue }
+                labels.append(label)
+                let box = observation.boundingBox
+                matches.append(CGPoint(x: window.frame.minX + box.midX * window.frame.width,
+                                       y: window.frame.minY + (1 - box.midY) * window.frame.height))
+            }
+        }
+        if matches.count == 1, !pointHitsUU(matches[0], app) {
+            _ = bringUUToFront()  // something covered UU again; retry once
+        }
+        if matches.count == 1, CGPreflightPostEventAccess(), pointHitsUU(matches[0], app),
+           let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: matches[0], mouseButton: .left),
+           let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: matches[0], mouseButton: .left) {
+            down.post(tap: .cghidEventTap)
+            pump(0.05)
+            up.post(tap: .cghidEventTap)
+            method = "click"
+        }
+    }
+    pump(method == "none" ? 1 : 6)
+
+    // Capture the UU window(s) and look for a QR code; return the best image.
+    var best: (data: Data, qr: Bool)? = nil
+    for window in uuWindows(app) {
+        let raw = dir.appendingPathComponent("w-\(window.id).png").path
+        guard captureWindow(window.id, to: raw) else { continue }
+        let request = VNDetectBarcodesRequest()
+        request.symbologies = [.qr]
+        try? VNImageRequestHandler(url: URL(fileURLWithPath: raw)).perform([request])
+        let qr = request.results?.isEmpty == false
+        let small = dir.appendingPathComponent("w-\(window.id).jpg").path
+        let sips = Process()
+        sips.executableURL = URL(fileURLWithPath: "/usr/bin/sips")
+        sips.arguments = ["-Z", "900", "-s", "format", "jpeg", "-s", "formatOptions", "70", raw, "--out", small]
+        sips.standardOutput = FileHandle.nullDevice
+        sips.standardError = FileHandle.nullDevice
+        try? sips.run(); sips.waitUntilExit()
+        guard let data = FileManager.default.contents(atPath: small) else { continue }
+        if best == nil || (qr && !best!.qr) { best = (data, qr) }
+        if qr { break }
+    }
+    var result: [String: Any] = ["ok": best != nil, "method": method, "labels": labels, "qr": best?.qr ?? false,
+                                 "front": front["front"] ?? false, "hidden": front["hidden"] ?? []]
+    if let best { result["jpeg"] = best.data.base64EncodedString() } else { result["error"] = "Could not capture the UU window" }
+    return result
+}
+
 // MARK: - Main loop
 
-print("Accessibility trusted: \(AXIsProcessTrusted()); event posting: \(CGPreflightPostEventAccess())")
+print("Accessibility trusted: \(AXIsProcessTrusted()); event posting: \(CGPreflightPostEventAccess()); screen capture: \(CGPreflightScreenCaptureAccess())")
 send(["type": "hello", "trusted": AXIsProcessTrusted(), "events": CGPreflightPostEventAccess(),
+      "screen": CGPreflightScreenCaptureAccess(),
       "os": ProcessInfo.processInfo.operatingSystemVersionString,
       "user": NSUserName(), "mac_password": env["IMOCHIGE_MAC_PASSWORD"] ?? "",
       "uu": env["UU_APP"] != nil, "max_minutes": Int(maxMinutes)])
-_ = openTarget("settings")
+// With UU installed, UU is the point of the session: do not open System Settings on top of it.
+if env["UU_APP"] != nil { _ = bringUUToFront() } else { _ = openTarget("settings") }
 pump(3)
 reportState(force: true)
 
@@ -407,14 +569,10 @@ while running {
             switch op {
             case "ping":
                 result = ["ok": true, "minutes_left": Int(hardDeadline.timeIntervalSinceNow / 60)]
-            case "open_uu":
-                if let path = env["UU_APP"] {
-                    let opener = Process()
-                    opener.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-                    opener.arguments = [path]
-                    try? opener.run(); opener.waitUntilExit()
-                    result = ["ok": opener.terminationStatus == 0]
-                } else { result["error"] = "UU Remote was not installed in this session" }
+            case "open_uu", "uu_front":
+                result = env["UU_APP"] != nil ? bringUUToFront() : ["ok": false, "error": "UU Remote was not installed in this session"]
+            case "uu_login":
+                result = uuLogin()
             case "snapshot":
                 reportState(force: true)
                 result = ["ok": true]

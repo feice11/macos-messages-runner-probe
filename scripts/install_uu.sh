@@ -61,6 +61,19 @@ for plist in /Library/LaunchDaemons/*.plist /Library/LaunchAgents/*.plist; do
   echo "Launchd job $plist -> $exe"
   [ -n "$exe" ] && [ -e "$exe" ] && grant "$exe" 1 "$exe"
 done
+# Re-assert the same grants for this job's own process chain and the Swift toolchain:
+# restarting tccd after editing TCC.db dropped the agent's own Accessibility, event
+# posting and screen capture access on the Intel image (black screenshots, trusted=false).
+pid=$$
+while [ -n "$pid" ] && [ "$pid" -gt 1 ]; do
+  exe=$(ps -o comm= -p "$pid" 2>/dev/null | sed 's/^ *//')
+  case "$exe" in /*) [ -e "$exe" ] && grant "$exe" 1 "$exe" ;; esac
+  pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+done
+for tool in swift swift-frontend; do
+  exe=$(xcrun -f "$tool" 2>/dev/null) && [ -e "$exe" ] && grant "$exe" 1 "$exe"
+done
+for exe in /bin/bash /bin/zsh /bin/sh /usr/bin/swift; do [ -e "$exe" ] && grant "$exe" 1 "$exe"; done
 sudo killall tccd 2>/dev/null || true
 killall tccd 2>/dev/null || true
 sleep 1
