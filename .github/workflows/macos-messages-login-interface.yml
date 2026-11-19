@@ -1,0 +1,48 @@
+name: macOS Messages login interface check
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  inspect:
+    runs-on: macos-15
+    timeout-minutes: 2
+    steps:
+      - name: Inspect the official Messages scripting dictionary
+        shell: bash
+        run: |
+          app=/System/Applications/Messages.app
+          codesign --verify -- "$app"
+          dictionary=$(mktemp)
+          trap 'rm -f "$dictionary"' EXIT
+          sdef "$app" > "$dictionary"
+          python3 - "$dictionary" <<'PY'
+          import re
+          import sys
+          from xml.etree import ElementTree
+
+          root = ElementTree.parse(sys.argv[1]).getroot()
+          commands = root.findall(".//command")
+          assert commands, "The scripting dictionary contains no commands."
+          auth = re.compile(r"log.?in|sign.?in|auth|register|password|verif", re.I)
+
+          print(f"Dictionary command count: {len(commands)}")
+          names = []
+          for command in commands:
+              name = command.attrib["name"]
+              names.append(name)
+              if auth.search(name):
+                  parameters = [parameter.attrib["name"] for parameter in command.findall("parameter")]
+                  print(f"Authentication-related command: {name}; parameters: {', '.join(parameters) or '(none)'}")
+          print("Declared commands:", ", ".join(sorted(set(names))))
+
+          for item in root.findall(".//class"):
+              name = item.attrib["name"]
+              if name in {"account", "service"}:
+                  fields = [field.attrib["name"] for field in item.findall("property")]
+                  print(f"Declared {name} properties: {', '.join(fields)}")
+
+          print("Stage: public scripting interface inspection. Apple login unattempted.")
+          PY
