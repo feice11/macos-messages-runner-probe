@@ -205,8 +205,8 @@ jobs:
               print("\(source) sign-in window roles: \(counts.joined(separator: ", "))")
               reportSurface(windowNodes, source: "\(source) sign-in window")
               for field in windowNodes.filter({ (attribute($0, kAXRoleAttribute) as? String) == kAXTextFieldRole }) {
-                  let subrole = attribute(field, kAXSubroleAttribute) as? String
-                  let classification = ["AXSearchField", "AXSecureTextField"].first { $0 == subrole } ?? "ordinary"
+                  let subrole = attribute(field, kAXSubroleAttribute) as? String ?? ""
+                  let classification = ["AXSearchField", "AXSecureTextField"].contains(subrole) ? subrole : "ordinary"
                   let focused = (attribute(field, kAXFocusedAttribute) as? Bool) == true
                   let empty = (attribute(field, kAXValueAttribute) as? String) == ""
                   print("\(source) sign-in text field: \(classification), focused: \(focused), empty: \(empty)")
@@ -346,27 +346,48 @@ jobs:
           }
 
           let marker = "probe-\(CommandLine.arguments[2])@example.invalid"
-          for unit in marker.utf16 {
-              guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
-                    let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else {
-                  exit(EXIT_FAILURE)
+          var writable: DarwinBoolean = false
+          let query = AXUIElementIsAttributeSettable(field, kAXValueAttribute as CFString, &writable)
+          let canSetValue = query == .success && writable.boolValue
+          print("Synthetic account field AXValue writable: \(canSetValue)")
+          if canSetValue {
+              let write = AXUIElementSetAttributeValue(field, kAXValueAttribute as CFString, marker as CFString)
+              print("Synthetic account field AXValue write result: \(write.rawValue)")
+              RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+          }
+          if (attribute(field, kAXValueAttribute) as? String) == "",
+             NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier {
+              print("Synthetic account field trying the frontmost keyboard route.")
+              for unit in marker.utf16 {
+                  guard app.isActive,
+                        (attribute(field, kAXFocusedAttribute) as? Bool) == true,
+                        let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
+                        let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else { break }
+                  var character = unit
+                  down.keyboardSetUnicodeString(stringLength: 1, unicodeString: &character)
+                  down.post(tap: .cghidEventTap)
+                  up.post(tap: .cghidEventTap)
+                  RunLoop.current.run(until: Date().addingTimeInterval(0.025))
               }
-              var character = unit
-              down.keyboardSetUnicodeString(stringLength: 1, unicodeString: &character)
-              down.postToPid(app.processIdentifier)
-              up.postToPid(app.processIdentifier)
           }
           RunLoop.current.run(until: Date().addingTimeInterval(0.5))
           let entered = attribute(field, kAXValueAttribute) as? String ?? ""
-          print("Synthetic account field value verified: \(entered == marker)")
-          if !entered.isEmpty, marker.hasPrefix(entered), (attribute(field, kAXFocusedAttribute) as? Bool) == true {
-              for (key, flags) in [(kVK_ANSI_A, CGEventFlags.maskCommand), (kVK_Delete, CGEventFlags())] {
-                  let keyDown = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(key), keyDown: true)
-                  let keyUp = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(key), keyDown: false)
-                  keyDown?.flags = flags
-                  keyUp?.flags = flags
-                  keyDown?.postToPid(app.processIdentifier)
-                  keyUp?.postToPid(app.processIdentifier)
+          print("Synthetic account field value verified: \(entered == marker); observed length: \(entered.count)")
+          if !entered.isEmpty, marker.hasPrefix(entered) {
+              if canSetValue {
+                  _ = AXUIElementSetAttributeValue(field, kAXValueAttribute as CFString, "" as CFString)
+              }
+              if (attribute(field, kAXValueAttribute) as? String) == entered,
+                 NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier,
+                 (attribute(field, kAXFocusedAttribute) as? Bool) == true {
+                  for (key, flags) in [(kVK_ANSI_A, CGEventFlags.maskCommand), (kVK_Delete, CGEventFlags())] {
+                      let keyDown = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(key), keyDown: true)
+                      let keyUp = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(key), keyDown: false)
+                      keyDown?.flags = flags
+                      keyUp?.flags = flags
+                      keyDown?.post(tap: .cghidEventTap)
+                      keyUp?.post(tap: .cghidEventTap)
+                  }
               }
               RunLoop.current.run(until: Date().addingTimeInterval(0.5))
               print("Synthetic account field cleared: \((attribute(field, kAXValueAttribute) as? String) == "")")
