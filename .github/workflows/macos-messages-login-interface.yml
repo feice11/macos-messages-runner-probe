@@ -73,7 +73,7 @@ jobs:
               print("Stage: stopped before reading or interacting with login controls.")
               exit(EXIT_SUCCESS)
           }
-          guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: CommandLine.arguments[1]).first else {
+          guard var app = NSRunningApplication.runningApplications(withBundleIdentifier: CommandLine.arguments[1]).first else {
               print("Stage: Messages process not found.")
               exit(EXIT_FAILURE)
           }
@@ -84,8 +84,8 @@ jobs:
               return AXUIElementCopyAttributeValue(node, name as CFString, &value) == .success ? value : nil
           }
 
-          let application = AXUIElementCreateApplication(app.processIdentifier)
           func waitForWindows() -> [AXUIElement] {
+              let application = AXUIElementCreateApplication(app.processIdentifier)
               var lastError = AXError.success
               for _ in 0..<12 {
                   var value: CFTypeRef?
@@ -129,6 +129,34 @@ jobs:
               }.joined(separator: " ").lowercased()
           }
 
+          func accountFields(_ nodes: [AXUIElement]) -> [AXUIElement] {
+              nodes.filter { node in
+                  guard (attribute(node, kAXRoleAttribute) as? String) == kAXTextFieldRole,
+                        (attribute(node, kAXSubroleAttribute) as? String) != "AXSecureTextField" else { return false }
+                  let hints = label(node)
+                  return !hints.contains("password")
+                      && ["apple account", "apple id", "email", "phone number"].contains { hints.contains($0) }
+              }
+          }
+
+          func openSignInEntry(_ nodes: [AXUIElement], source: String) -> [AXUIElement] {
+              guard let entry = nodes.first(where: { node in
+                  let role = attribute(node, kAXRoleAttribute) as? String
+                  let title = (attribute(node, kAXTitleAttribute) as? String
+                      ?? attribute(node, kAXDescriptionAttribute) as? String ?? "")
+                      .lowercased().trimmingCharacters(in: CharacterSet(charactersIn: " .…"))
+                  return (role == kAXButtonRole || role == kAXLinkRole)
+                      && ["sign in", "sign in to your apple account", "sign in to apple account"].contains(title)
+              }) else {
+                  print("\(source) sign-in entry not exposed.")
+                  return nodes
+              }
+              let result = AXUIElementPerformAction(entry, kAXPressAction as CFString)
+              print("\(source) sign-in entry action: \(result.rawValue)")
+              RunLoop.current.run(until: Date().addingTimeInterval(3))
+              return descendants(waitForWindows())
+          }
+
           var nodes = descendants(windows)
           if let tab = nodes.first(where: {
               let role = attribute($0, kAXRoleAttribute) as? String
@@ -141,14 +169,26 @@ jobs:
               nodes = descendants(waitForWindows())
           }
 
-          let fields = nodes.filter { (attribute($0, kAXRoleAttribute) as? String) == kAXTextFieldRole }
-          print("Exposed text field count: \(fields.count)")
-          let candidates = fields.filter { node in
-              guard (attribute(node, kAXSubroleAttribute) as? String) != "AXSecureTextField" else { return false }
-              let hints = label(node)
-              return !hints.contains("password")
-                  && ["apple account", "apple id", "email", "phone number"].contains { hints.contains($0) }
+          if accountFields(nodes).isEmpty {
+              nodes = openSignInEntry(nodes, source: "Messages")
           }
+          if accountFields(nodes).isEmpty {
+              let opener = Process()
+              opener.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+              opener.arguments = ["/System/Applications/System Settings.app"]
+              try opener.run()
+              opener.waitUntilExit()
+              for _ in 0..<10 {
+                  if let settings = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.systempreferences").first {
+                      app = settings
+                      _ = app.activate(options: [])
+                      nodes = openSignInEntry(descendants(waitForWindows()), source: "System Settings")
+                      break
+                  }
+                  RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+              }
+          }
+          let candidates = accountFields(nodes)
           print("Identifiable account field count: \(candidates.count)")
           guard candidates.count == 1, let field = candidates.first,
                 CGPreflightPostEventAccess(),
