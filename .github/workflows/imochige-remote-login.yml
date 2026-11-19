@@ -17,6 +17,10 @@ on:
         type: choice
         options: [macos-15, macos-15-intel, macos-14, macos-26]
         default: macos-15
+      uu:
+        description: Install NetEase UU Remote for remote desktop
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -29,11 +33,15 @@ concurrency:
 jobs:
   sign-in:
     runs-on: ${{ inputs.runner }}
-    timeout-minutes: 40
+    timeout-minutes: 130
     steps:
       - uses: actions/checkout@v4
         with:
           sparse-checkout: scripts
+      - name: Install UU Remote
+        if: inputs.uu
+        shell: bash
+        run: bash scripts/install_uu.sh
       - name: Run the encrypted sign-in agent
         shell: bash
         env:
@@ -41,6 +49,8 @@ jobs:
           IMOCHIGE_SESSION: ${{ inputs.session_id }}
           IMOCHIGE_ISSUE: ${{ inputs.issue }}
           GH_TOKEN: ${{ github.token }}
+          IMOCHIGE_MAX_MINUTES: "${{ inputs.uu && '125' || '38' }}"
+          IMOCHIGE_IDLE_MINUTES: "${{ inputs.uu && '45' || '15' }}"
         run: |
           [[ "$IMOCHIGE_SESSION" =~ ^[0-9a-f]{12}$ ]] || { echo "Bad session marker"; exit 1; }
           [[ "$IMOCHIGE_ISSUE" =~ ^[0-9]+$ ]] || { echo "Bad issue number"; exit 1; }

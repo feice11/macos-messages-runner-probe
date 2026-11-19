@@ -26,7 +26,9 @@ let repo = need("GITHUB_REPOSITORY")
 let token = need("GH_TOKEN")
 let api = env["GITHUB_API_URL"] ?? "https://api.github.com"
 let started = Date()
-let hardDeadline = started.addingTimeInterval(38 * 60)
+let maxMinutes = Double(env["IMOCHIGE_MAX_MINUTES"] ?? "") ?? 38
+let idleMinutes = Double(env["IMOCHIGE_IDLE_MINUTES"] ?? "") ?? 15
+let hardDeadline = started.addingTimeInterval(maxMinutes * 60)
 var lastCommand = Date()
 
 // MARK: - GitHub transport
@@ -137,6 +139,7 @@ func watchedApps() -> [NSRunningApplication] {
         guard let id = app.bundleIdentifier else { return false }
         let lower = id.lowercased()
         return watchedBundles.contains(id)
+            || (env["UU_APP"] != nil && app.bundleURL?.path.hasPrefix(env["UU_APP"]!) == true)
             || (id.hasPrefix("com.apple.") && ["authkit", "appleid", "appleaccount", "akd", "icloud"].contains { lower.contains($0) })
     }
 }
@@ -366,7 +369,8 @@ func screenshot() -> [String: Any] {
 print("Accessibility trusted: \(AXIsProcessTrusted()); event posting: \(CGPreflightPostEventAccess())")
 send(["type": "hello", "trusted": AXIsProcessTrusted(), "events": CGPreflightPostEventAccess(),
       "os": ProcessInfo.processInfo.operatingSystemVersionString,
-      "user": NSUserName(), "mac_password": env["IMOCHIGE_MAC_PASSWORD"] ?? ""])
+      "user": NSUserName(), "mac_password": env["IMOCHIGE_MAC_PASSWORD"] ?? "",
+      "uu": env["UU_APP"] != nil, "max_minutes": Int(maxMinutes)])
 _ = openTarget("settings")
 pump(3)
 reportState(force: true)
@@ -376,8 +380,8 @@ var lastSnapshot = Date()
 var running = true
 while running {
     let now = Date()
-    if now > hardDeadline || now.timeIntervalSince(lastCommand) > 15 * 60 {
-        send(["type": "bye", "reason": now > hardDeadline ? "time limit" : "idle for 15 minutes"])
+    if now > hardDeadline || now.timeIntervalSince(lastCommand) > idleMinutes * 60 {
+        send(["type": "bye", "reason": now > hardDeadline ? "time limit" : "idle for \(Int(idleMinutes)) minutes"])
         break
     }
     if now.timeIntervalSince(lastPoll) >= 2 {
@@ -401,6 +405,16 @@ while running {
                 }
             }
             switch op {
+            case "ping":
+                result = ["ok": true, "minutes_left": Int(hardDeadline.timeIntervalSinceNow / 60)]
+            case "open_uu":
+                if let path = env["UU_APP"] {
+                    let opener = Process()
+                    opener.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+                    opener.arguments = [path]
+                    try? opener.run(); opener.waitUntilExit()
+                    result = ["ok": opener.terminationStatus == 0]
+                } else { result["error"] = "UU Remote was not installed in this session" }
             case "snapshot":
                 reportState(force: true)
                 result = ["ok": true]
