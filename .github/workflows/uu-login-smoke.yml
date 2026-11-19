@@ -88,6 +88,60 @@ jobs:
               return (windows.count, captures, false)
           }
 
+          func clickVisibleLogin(_ app: NSRunningApplication, directory: URL) throws -> Bool {
+              guard CGPreflightPostEventAccess(),
+                    NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier else {
+                  print("UU is not the active app or this test lacks input permission")
+                  return false
+              }
+              let windows = (CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements],
+                                                        kCGNullWindowID) as? [[String: Any]] ?? [])
+              let labels: Set<String> = [
+                  "登录", "立即登录", "点击登录", "登录账号", "未登录", "去登录", "请登录",
+                  "登录/注册", "注册/登录", "登录注册", "账号登录", "扫码登录", "微信登录",
+                  "signin", "login", "signuptologin"
+              ]
+              var matches = [(label: String, point: CGPoint)]()
+              for window in windows {
+                  guard window[kCGWindowOwnerPID as String] as? Int32 == app.processIdentifier,
+                        window[kCGWindowLayer as String] as? Int == 0,
+                        let id = window[kCGWindowNumber as String] as? Int,
+                        let bounds = window[kCGWindowBounds as String] as? NSDictionary,
+                        let frame = CGRect(dictionaryRepresentation: bounds as CFDictionary),
+                        frame.width >= 200, frame.height >= 120 else { continue }
+                  let image = directory.appendingPathComponent("ocr-\(id).png")
+                  defer { try? FileManager.default.removeItem(at: image) }
+                  let capture = Process()
+                  capture.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+                  capture.arguments = ["-x", "-o", "-l", String(id), image.path]
+                  capture.standardError = FileHandle.nullDevice
+                  try capture.run()
+                  capture.waitUntilExit()
+                  guard capture.terminationStatus == 0 else { continue }
+                  let request = VNRecognizeTextRequest()
+                  request.recognitionLanguages = ["zh-Hans", "en-US"]
+                  try VNImageRequestHandler(url: image).perform([request])
+                  for observation in request.results ?? [] {
+                      guard let text = observation.topCandidates(1).first?.string else { continue }
+                      let label = text.lowercased().filter { !$0.isWhitespace }.replacingOccurrences(of: "／", with: "/")
+                      guard labels.contains(label) else { continue }
+                      let box = observation.boundingBox
+                      matches.append((label, CGPoint(x: frame.minX + box.midX * frame.width,
+                                                     y: frame.minY + (1 - box.midY) * frame.height)))
+                  }
+              }
+              print("UU login labels recognized: \(matches.map(\.label).joined(separator: ", "))")
+              guard matches.count == 1, let point = matches.first?.point,
+                    NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier,
+                    let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown,
+                                       mouseCursorPosition: point, mouseButton: .left),
+                    let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp,
+                                     mouseCursorPosition: point, mouseButton: .left) else { return false }
+              down.post(tap: .cghidEventTap)
+              up.post(tap: .cghidEventTap)
+              return true
+          }
+
           for _ in 0..<15 {
               if !NSRunningApplication.runningApplications(withBundleIdentifier: "com.netease.uuremote").isEmpty {
                   break
@@ -116,7 +170,14 @@ jobs:
               }
               let pressed = pressUniqueButton(root, labels: ["登录", "立即登录", "sign in", "log in"])
               print("Opened a UU login button: \(pressed)")
-              if pressed { Thread.sleep(forTimeInterval: 8) }
+              var loginOpened = pressed
+              if !pressed {
+                  app.activate()
+                  Thread.sleep(forTimeInterval: 2)
+                  loginOpened = try clickVisibleLogin(app, directory: directory)
+                  print("Clicked a visible UU login label: \(loginOpened)")
+              }
+              if loginOpened { Thread.sleep(forTimeInterval: 8) }
               let updated = try scanWindows(pid: app.processIdentifier, directory: directory)
               print("UU window images readable after UI check: \(updated.captures)")
               foundQR = updated.qr
