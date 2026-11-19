@@ -145,7 +145,7 @@ jobs:
                   let title = (attribute(node, kAXTitleAttribute) as? String
                       ?? attribute(node, kAXDescriptionAttribute) as? String ?? "")
                       .lowercased().trimmingCharacters(in: CharacterSet(charactersIn: " .…"))
-                  return (role == kAXButtonRole || role == kAXLinkRole)
+                  return (role == kAXButtonRole || role == "AXLink")
                       && ["sign in", "sign in to your apple account", "sign in to apple account"].contains(title)
               }) else {
                   print("\(source) sign-in entry not exposed.")
