@@ -207,14 +207,30 @@ func snapshot() -> [String: Any] {
     return ["windows": windowsOut, "frontmost": NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? ""]
 }
 
+var lastStateWindows: [String] = []
+var lastStatePost = Date.distantPast
 func reportState(force: Bool = false) {
     let state = snapshot()
-    guard let data = try? JSONSerialization.data(withJSONObject: state, options: [.sortedKeys]),
-          let json = String(data: data, encoding: .utf8) else { return }
-    if force || json != lastStateJSON {
-        lastStateJSON = json
-        send(["type": "state", "state": state])
+    // Compare without volatile focus/activation flags so an unchanged UI is not re-posted.
+    let windows = (state["windows"] as? [[String: Any]] ?? []).map { window -> String in
+        var copy = window
+        copy["active"] = nil
+        copy["fields"] = (window["fields"] as? [[String: Any]] ?? []).map { field -> [String: Any] in
+            var f = field; f["focused"] = nil; return f
+        }
+        let data = (try? JSONSerialization.data(withJSONObject: copy, options: [.sortedKeys])) ?? Data()
+        return String(data: data, encoding: .utf8) ?? ""
     }
+    let json = windows.joined(separator: "\n")
+    guard force || (json != lastStateJSON && Date().timeIntervalSince(lastStatePost) >= 2.5) else { return }
+    if !force {
+        let changed = windows.indices.filter { $0 >= lastStateWindows.count || lastStateWindows[$0] != windows[$0] }
+        print("State changed: windows \(lastStateWindows.count) -> \(windows.count), differing indices \(changed)")
+    }
+    lastStateJSON = json
+    lastStateWindows = windows
+    lastStatePost = Date()
+    send(["type": "state", "state": state])
 }
 
 func postKey(_ code: Int, flags: CGEventFlags = []) {
