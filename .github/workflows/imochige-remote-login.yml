@@ -83,10 +83,11 @@ jobs:
             echo "Mac login password reset verified for $user"
             export IMOCHIGE_MAC_PASSWORD
             security delete-keychain "$HOME/Library/Keychains/login.keychain-db" 2>/dev/null || true
-            security create-keychain -p "$IMOCHIGE_MAC_PASSWORD" login.keychain
-            security default-keychain -s login.keychain
-            security login-keychain -s login.keychain
-            security unlock-keychain -p "$IMOCHIGE_MAC_PASSWORD" login.keychain
+            # Keychain steps are best effort: a failure here must not stop the agent.
+            security create-keychain -p "$IMOCHIGE_MAC_PASSWORD" login.keychain 2>&1 || echo "create-keychain failed ($?)"
+            security default-keychain -s login.keychain 2>&1 || echo "default-keychain failed ($?)"
+            security login-keychain -s login.keychain 2>&1 || echo "login-keychain failed ($?)"
+            security unlock-keychain -p "$IMOCHIGE_MAC_PASSWORD" login.keychain 2>&1 || echo "unlock-keychain failed ($?)"
             echo "Login keychain recreated with the new password"
           else
             echo "Mac login password reset could not be verified"
