@@ -137,12 +137,17 @@ jobs:
               let currentWindows = (CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements],
                                                               kCGNullWindowID) as? [[String: Any]] ?? [])
               let visibleWindow = currentWindows.first { window in
-                  guard let bounds = window[kCGWindowBounds as String] as? NSDictionary,
+                  guard window[kCGWindowLayer as String] as? Int == 0,
+                        let bounds = window[kCGWindowBounds as String] as? NSDictionary,
                         let frame = CGRect(dictionaryRepresentation: bounds as CFDictionary),
                         (window[kCGWindowAlpha as String] as? Double ?? 1) > 0 else { return false }
                   return frame.contains(point)
               }
-              guard visibleWindow?[kCGWindowNumber as String] as? Int == match.window,
+              let hitUU = visibleWindow?[kCGWindowOwnerPID as String] as? Int32 == app.processIdentifier
+              let hitLoginWindow = visibleWindow?[kCGWindowNumber as String] as? Int == match.window
+              print("Visible login point belongs to the UU login window: \(hitLoginWindow)")
+              print("Visible login point belongs to a UU window: \(hitUU)")
+              guard hitLoginWindow,
                     let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown,
                                        mouseCursorPosition: point, mouseButton: .left),
                     let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp,
@@ -185,7 +190,14 @@ jobs:
               print("Opened a UU login button: \(pressed)")
               var loginOpened = pressed
               if !pressed {
-                  app.activate()
+                  app.activate(options: [.activateAllWindows])
+                  AXUIElementSetAttributeValue(root, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+                  var main: CFTypeRef?
+                  if AXUIElementCopyAttributeValue(root, kAXMainWindowAttribute as CFString, &main) == .success,
+                     let main, CFGetTypeID(main) == AXUIElementGetTypeID() {
+                      let window = unsafeDowncast(main, to: AXUIElement.self)
+                      AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+                  }
                   RunLoop.current.run(until: Date().addingTimeInterval(2))
                   loginOpened = try clickVisibleLogin(app, directory: directory)
                   print("Clicked a visible UU login label: \(loginOpened)")
