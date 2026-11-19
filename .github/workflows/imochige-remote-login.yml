@@ -12,6 +12,11 @@ on:
         description: Issue number used as the encrypted message channel
         type: string
         required: true
+      runner:
+        description: macOS runner image
+        type: choice
+        options: [macos-15, macos-15-intel, macos-14, macos-26]
+        default: macos-15
 
 permissions:
   contents: read
@@ -23,7 +28,7 @@ concurrency:
 
 jobs:
   sign-in:
-    runs-on: macos-15
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
