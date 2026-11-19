@@ -62,6 +62,7 @@ jobs:
           cat > "$work/probe.swift" <<'SWIFT'
           import AppKit
           import ApplicationServices
+          import Carbon
           import CoreGraphics
           import Darwin
 
@@ -76,6 +77,7 @@ jobs:
               print("Stage: Messages process not found.")
               exit(EXIT_FAILURE)
           }
+          _ = app.activate(options: [])
 
           func attribute(_ node: AXUIElement, _ name: String) -> CFTypeRef? {
               var value: CFTypeRef?
@@ -83,7 +85,31 @@ jobs:
           }
 
           let application = AXUIElementCreateApplication(app.processIdentifier)
-          let windows = attribute(application, kAXWindowsAttribute) as? [AXUIElement] ?? []
+          func waitForWindows() -> [AXUIElement] {
+              var lastError = AXError.success
+              for _ in 0..<12 {
+                  var value: CFTypeRef?
+                  lastError = AXUIElementCopyAttributeValue(application, kAXWindowsAttribute as CFString, &value)
+                  if let windows = value as? [AXUIElement], !windows.isEmpty {
+                      return windows
+                  }
+                  RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+              }
+              print("Window query result: \(lastError.rawValue); app active: \(app.isActive)")
+              return []
+          }
+
+          var windows = waitForWindows()
+          if windows.isEmpty && CGPreflightPostEventAccess(),
+             let keyDown = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(kVK_ANSI_Comma), keyDown: true),
+             let keyUp = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(kVK_ANSI_Comma), keyDown: false) {
+              keyDown.flags = .maskCommand
+              keyUp.flags = .maskCommand
+              keyDown.postToPid(app.processIdentifier)
+              keyUp.postToPid(app.processIdentifier)
+              print("Sent the Settings shortcut to Messages.")
+              windows = waitForWindows()
+          }
           print("Accessible Messages window count: \(windows.count)")
           var queue = windows
           var next = 0
