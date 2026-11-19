@@ -2,6 +2,11 @@ name: macOS Messages login interface check
 
 on:
   workflow_dispatch:
+    inputs:
+      probe_nonce:
+        description: Synthetic test marker (12 lowercase hex digits)
+        type: string
+        required: true
 
 permissions: {}
 
@@ -54,6 +59,19 @@ jobs:
       - name: Check permission to access the official login window
         shell: bash
         run: |
+          nonce=$(python3 - <<'PY'
+          import json
+          import os
+          import re
+
+          with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as event:
+              nonce = json.load(event).get("inputs", {}).get("probe_nonce", "")
+          if not re.fullmatch(r"[0-9a-f]{12}", nonce):
+              raise SystemExit("Expected a synthetic marker containing exactly 12 lowercase hex digits.")
+          print(nonce)
+          PY
+          )
+          printf 'Synthetic dispatch marker received: %s\n' "$nonce"
           app=/System/Applications/Messages.app
           bundle_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")
           open "$app"
@@ -139,6 +157,13 @@ jobs:
               }
           }
 
+          func reportSurface(_ nodes: [AXUIElement], source: String) {
+              let labels = nodes.map(label)
+              let signals = ["apple account", "sign in", "unable", "not available", "email", "phone number"]
+                  .filter { signal in labels.contains { $0.contains(signal) } }
+              print("\(source) surface: \(nodes.count) controls; known login signals: \(signals.joined(separator: ", "))")
+          }
+
           func openSignInEntry(_ nodes: [AXUIElement], source: String) -> [AXUIElement] {
               guard let entry = nodes.first(where: { node in
                   let role = attribute(node, kAXRoleAttribute) as? String
@@ -170,19 +195,25 @@ jobs:
           }
 
           if accountFields(nodes).isEmpty {
+              reportSurface(nodes, source: "Messages")
               nodes = openSignInEntry(nodes, source: "Messages")
           }
           if accountFields(nodes).isEmpty {
               let opener = Process()
               opener.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-              opener.arguments = ["/System/Applications/System Settings.app"]
+              opener.arguments = ["x-apple.systempreferences:com.apple.systempreferences.AppleIDSettings"]
               try opener.run()
               opener.waitUntilExit()
+              print("Apple Account settings link exit code: \(opener.terminationStatus)")
               for _ in 0..<10 {
                   if let settings = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.systempreferences").first {
                       app = settings
                       _ = app.activate(options: [])
-                      nodes = openSignInEntry(descendants(waitForWindows()), source: "System Settings")
+                      let accountPane = descendants(waitForWindows())
+                      reportSurface(accountPane, source: "System Settings")
+                      nodes = accountFields(accountPane).isEmpty
+                          ? openSignInEntry(accountPane, source: "System Settings")
+                          : accountPane
                       break
                   }
                   RunLoop.current.run(until: Date().addingTimeInterval(0.5))
@@ -199,7 +230,7 @@ jobs:
               exit(EXIT_SUCCESS)
           }
 
-          let marker = "imochige-test@example.invalid"
+          let marker = "probe-\(CommandLine.arguments[2])@example.invalid"
           let units = Array(marker.utf16)
           guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
                 let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else {
@@ -227,4 +258,4 @@ jobs:
           }
           print("Stage: synthetic UI input check. Apple login unattempted.")
           SWIFT
-          swift "$work/probe.swift" "$bundle_id"
+          swift "$work/probe.swift" "$bundle_id" "$nonce"
