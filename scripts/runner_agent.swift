@@ -468,7 +468,8 @@ func uuLogin() -> [String: Any] {
     var labels: [String] = []
     if method == "none" {
         var matches: [CGPoint] = []
-        for window in uuWindows(app) {
+        // Windows come front to back; stop at the first one that shows the login label.
+        for window in uuWindows(app) where matches.isEmpty {
             let image = dir.appendingPathComponent("ocr-\(window.id).png").path
             guard captureWindow(window.id, to: image) else { continue }
             let request = VNRecognizeTextRequest()
@@ -484,12 +485,16 @@ func uuLogin() -> [String: Any] {
                                        y: window.frame.minY + (1 - box.midY) * window.frame.height))
             }
         }
-        if matches.count == 1, !pointHitsUU(matches[0], app) {
+        if !matches.isEmpty, !matches.contains(where: { pointHitsUU($0, app) }) {
             _ = bringUUToFront()  // something covered UU again; retry once
         }
-        if matches.count == 1, CGPreflightPostEventAccess(), pointHitsUU(matches[0], app),
-           let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: matches[0], mouseButton: .left),
-           let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: matches[0], mouseButton: .left) {
+        // Several hits (duplicate windows, the label repeated in a banner): take the first visible one.
+        if let target = matches.first(where: { pointHitsUU($0, app) }), CGPreflightPostEventAccess(),
+           let move = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: target, mouseButton: .left),
+           let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: target, mouseButton: .left),
+           let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: target, mouseButton: .left) {
+            move.post(tap: .cghidEventTap)
+            pump(0.1)
             down.post(tap: .cghidEventTap)
             pump(0.05)
             up.post(tap: .cghidEventTap)
