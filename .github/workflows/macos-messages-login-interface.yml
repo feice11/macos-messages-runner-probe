@@ -102,8 +102,9 @@ jobs:
               return AXUIElementCopyAttributeValue(node, name as CFString, &value) == .success ? value : nil
           }
 
-          func waitForWindows() -> [AXUIElement] {
-              let application = AXUIElementCreateApplication(app.processIdentifier)
+          func waitForWindows(in target: NSRunningApplication? = nil) -> [AXUIElement] {
+              let target = target ?? app
+              let application = AXUIElementCreateApplication(target.processIdentifier)
               var lastError = AXError.success
               for _ in 0..<12 {
                   var value: CFTypeRef?
@@ -113,7 +114,7 @@ jobs:
                   }
                   RunLoop.current.run(until: Date().addingTimeInterval(0.5))
               }
-              print("Window query result: \(lastError.rawValue); app active: \(app.isActive)")
+              print("Window query result: \(lastError.rawValue); app active: \(target.isActive)")
               return []
           }
 
@@ -163,9 +164,27 @@ jobs:
                       ? (attribute(node, kAXValueAttribute) as? String ?? "") : ""
                   return label(node) + " " + staticText.lowercased()
               }
-              let signals = ["apple account", "sign in", "unable", "not available", "email", "phone number"]
+              let signals = ["apple account", "sign in", "unable", "not available", "email", "phone number",
+                             "could not connect", "connection failed", "enter", "continue", "cancel", "try again"]
                   .filter { signal in labels.contains { $0.contains(signal) } }
               print("\(source) surface: \(nodes.count) controls; known login signals: \(signals.joined(separator: ", "))")
+          }
+
+          func isSignInWindow(_ node: AXUIElement) -> Bool {
+              let title = (attribute(node, kAXTitleAttribute) as? String)?.lowercased() ?? ""
+              return (attribute(node, kAXRoleAttribute) as? String) == kAXWindowRole
+                  && ["sign in", "sign in to your apple account", "apple account"].contains(title)
+          }
+
+          func reportSignInWindow(_ window: AXUIElement, source: String) {
+              let windowNodes = descendants([window])
+              let types = [kAXTextFieldRole, kAXStaticTextRole, kAXButtonRole, "AXWebArea", "AXSheet", "AXProgressIndicator"]
+              let counts = types.map { role in
+                  let count = windowNodes.filter { (attribute($0, kAXRoleAttribute) as? String) == role }.count
+                  return "\(role)=\(count)"
+              }
+              print("\(source) sign-in window roles: \(counts.joined(separator: ", "))")
+              reportSurface(windowNodes, source: "\(source) sign-in window")
           }
 
           func openSignInEntry(_ nodes: [AXUIElement], source: String) -> [AXUIElement] {
@@ -249,6 +268,33 @@ jobs:
                       nodes = accountFields(accountPane).isEmpty
                           ? openSignInEntry(accountPane, source: "System Settings")
                           : accountPane
+                      for _ in 0..<20 {
+                          if !accountFields(nodes).isEmpty { break }
+                          RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+                          nodes = descendants(waitForWindows())
+                      }
+                      for window in nodes.filter(isSignInWindow) {
+                          reportSignInWindow(window, source: "System Settings")
+                      }
+                      if accountFields(nodes).isEmpty {
+                          let authIdentifiers = ["appleid", "appleaccount", "authkit"]
+                          for helper in NSWorkspace.shared.runningApplications {
+                              guard let identifier = helper.bundleIdentifier, identifier.hasPrefix("com.apple."),
+                                    authIdentifiers.contains(where: { identifier.lowercased().contains($0) }) else { continue }
+                              let process = AXUIElementCreateApplication(helper.processIdentifier)
+                              let helperWindows = attribute(process, kAXWindowsAttribute) as? [AXUIElement] ?? []
+                              print("Apple sign-in helper: \(identifier), windows: \(helperWindows.count)")
+                              let signInWindows = helperWindows.filter(isSignInWindow)
+                              for window in signInWindows { reportSignInWindow(window, source: identifier) }
+                              let helperNodes = descendants(signInWindows)
+                              if accountFields(helperNodes).count == 1 {
+                                  app = helper
+                                  _ = app.activate(options: [])
+                                  nodes = helperNodes
+                                  break
+                              }
+                          }
+                      }
                       break
                   }
                   RunLoop.current.run(until: Date().addingTimeInterval(0.5))
