@@ -148,14 +148,33 @@ jobs:
               }.joined(separator: " ").lowercased()
           }
 
+          func ordinaryTextField(_ node: AXUIElement) -> Bool {
+              let subrole = attribute(node, kAXSubroleAttribute) as? String ?? ""
+              let hints = label(node)
+              return (attribute(node, kAXRoleAttribute) as? String) == kAXTextFieldRole
+                  && !["AXSecureTextField", "AXSearchField"].contains(subrole)
+                  && !hints.contains("password") && !hints.contains("search")
+                  && (attribute(node, kAXEnabledAttribute) as? Bool) != false
+          }
+
           func accountFields(_ nodes: [AXUIElement]) -> [AXUIElement] {
-              nodes.filter { node in
-                  guard (attribute(node, kAXRoleAttribute) as? String) == kAXTextFieldRole,
-                        (attribute(node, kAXSubroleAttribute) as? String) != "AXSecureTextField" else { return false }
-                  let hints = label(node)
-                  return !hints.contains("password")
-                      && ["apple account", "apple id", "email", "phone number"].contains { hints.contains($0) }
+              let hints = ["apple account", "apple id", "email", "phone number"]
+              let labelled = nodes.filter { node in
+                  ordinaryTextField(node) && hints.contains { label(node).contains($0) }
               }
+              if !labelled.isEmpty { return labelled }
+              let windows = nodes.filter(isSignInWindow)
+              guard windows.count == 1, let window = windows.first else { return [] }
+              let windowNodes = descendants([window])
+              let hasAccountPrompt = windowNodes.contains { node in
+                  guard (attribute(node, kAXRoleAttribute) as? String) == kAXStaticTextRole else { return false }
+                  let caption = (attribute(node, kAXValueAttribute) as? String ?? "").lowercased() + " " + label(node)
+                  return caption.contains("email") && caption.contains("phone number")
+              }
+              guard hasAccountPrompt else { return [] }
+              let fields = windowNodes.filter { ordinaryTextField($0) }
+              if fields.count == 1 { return fields }
+              return fields.filter { (attribute($0, kAXFocusedAttribute) as? Bool) == true }
           }
 
           func reportSurface(_ nodes: [AXUIElement], source: String) {
@@ -185,6 +204,13 @@ jobs:
               }
               print("\(source) sign-in window roles: \(counts.joined(separator: ", "))")
               reportSurface(windowNodes, source: "\(source) sign-in window")
+              for field in windowNodes.filter({ (attribute($0, kAXRoleAttribute) as? String) == kAXTextFieldRole }) {
+                  let subrole = attribute(field, kAXSubroleAttribute) as? String
+                  let classification = ["AXSearchField", "AXSecureTextField"].first { $0 == subrole } ?? "ordinary"
+                  let focused = (attribute(field, kAXFocusedAttribute) as? Bool) == true
+                  let empty = (attribute(field, kAXValueAttribute) as? String) == ""
+                  print("\(source) sign-in text field: \(classification), focused: \(focused), empty: \(empty)")
+              }
           }
 
           func openSignInEntry(_ nodes: [AXUIElement], source: String) -> [AXUIElement] {
@@ -304,28 +330,36 @@ jobs:
           print("Identifiable account field count: \(candidates.count)")
           guard candidates.count == 1, let field = candidates.first,
                 CGPreflightPostEventAccess(),
-                (attribute(field, kAXValueAttribute) as? String) == "",
-                AXUIElementSetAttributeValue(field, kAXFocusedAttribute as CFString, kCFBooleanTrue) == .success,
+                (attribute(field, kAXValueAttribute) as? String) == "" else {
+              print("Stage: no unambiguous, empty account field. No credentials or text sent.")
+              exit(EXIT_SUCCESS)
+          }
+          if (attribute(field, kAXFocusedAttribute) as? Bool) != true {
+              let focusResult = AXUIElementSetAttributeValue(field, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+              print("Synthetic account field focus action: \(focusResult.rawValue)")
+              RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+          }
+          guard app.isActive,
                 (attribute(field, kAXFocusedAttribute) as? Bool) == true else {
-              print("Stage: no unambiguous, empty, focused account field. No credentials or text sent.")
+              print("Stage: could not confirm keyboard focus for the account field. No credentials or text sent.")
               exit(EXIT_SUCCESS)
           }
 
           let marker = "probe-\(CommandLine.arguments[2])@example.invalid"
-          let units = Array(marker.utf16)
-          guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
-                let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else {
-              exit(EXIT_FAILURE)
+          for unit in marker.utf16 {
+              guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
+                    let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else {
+                  exit(EXIT_FAILURE)
+              }
+              var character = unit
+              down.keyboardSetUnicodeString(stringLength: 1, unicodeString: &character)
+              down.postToPid(app.processIdentifier)
+              up.postToPid(app.processIdentifier)
           }
-          units.withUnsafeBufferPointer {
-              down.keyboardSetUnicodeString(stringLength: $0.count, unicodeString: $0.baseAddress)
-          }
-          down.postToPid(app.processIdentifier)
-          up.postToPid(app.processIdentifier)
           RunLoop.current.run(until: Date().addingTimeInterval(0.5))
-          let confirmed = (attribute(field, kAXValueAttribute) as? String) == marker
-          print("Synthetic account field value verified: \(confirmed)")
-          if confirmed {
+          let entered = attribute(field, kAXValueAttribute) as? String ?? ""
+          print("Synthetic account field value verified: \(entered == marker)")
+          if !entered.isEmpty, marker.hasPrefix(entered), (attribute(field, kAXFocusedAttribute) as? Bool) == true {
               for (key, flags) in [(kVK_ANSI_A, CGEventFlags.maskCommand), (kVK_Delete, CGEventFlags())] {
                   let keyDown = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(key), keyDown: true)
                   let keyUp = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(key), keyDown: false)
