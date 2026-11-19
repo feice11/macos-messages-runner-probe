@@ -111,24 +111,80 @@ jobs:
               windows = waitForWindows()
           }
           print("Accessible Messages window count: \(windows.count)")
-          var queue = windows
-          var next = 0
-          var fields = 0
-          var editable = 0
-          while next < min(queue.count, 500) {
-              let node = queue[next]
-              next += 1
-              if (attribute(node, kAXRoleAttribute) as? String) == kAXTextFieldRole {
-                  fields += 1
-                  var settable = DarwinBoolean(false)
-                  if AXUIElementIsAttributeSettable(node, kAXValueAttribute as CFString, &settable) == .success,
-                     settable.boolValue {
-                      editable += 1
-                  }
+
+          func descendants(_ roots: [AXUIElement]) -> [AXUIElement] {
+              var nodes = roots
+              var index = 0
+              while index < min(nodes.count, 500) {
+                  let node = nodes[index]
+                  index += 1
+                  nodes.append(contentsOf: attribute(node, kAXChildrenAttribute) as? [AXUIElement] ?? [])
               }
-              queue.append(contentsOf: attribute(node, kAXChildrenAttribute) as? [AXUIElement] ?? [])
+              return Array(nodes.prefix(500))
           }
-          print("Exposed text field count: \(fields); writable: \(editable)")
-          print("Stage: read-only UI inspection. No field values read and no input sent.")
+
+          func label(_ node: AXUIElement) -> String {
+              [kAXTitleAttribute, kAXDescriptionAttribute, "AXPlaceholderValue"].compactMap {
+                  attribute(node, $0) as? String
+              }.joined(separator: " ").lowercased()
+          }
+
+          var nodes = descendants(windows)
+          if let tab = nodes.first(where: {
+              let role = attribute($0, kAXRoleAttribute) as? String
+              return (role == kAXButtonRole || role == kAXRadioButtonRole)
+                  && (attribute($0, kAXTitleAttribute) as? String) == "iMessage"
+          }) {
+              let result = AXUIElementPerformAction(tab, kAXPressAction as CFString)
+              print("iMessage settings tab action: \(result.rawValue)")
+              RunLoop.current.run(until: Date().addingTimeInterval(2))
+              nodes = descendants(waitForWindows())
+          }
+
+          let fields = nodes.filter { (attribute($0, kAXRoleAttribute) as? String) == kAXTextFieldRole }
+          print("Exposed text field count: \(fields.count)")
+          let candidates = fields.filter { node in
+              guard (attribute(node, kAXSubroleAttribute) as? String) != "AXSecureTextField" else { return false }
+              let hints = label(node)
+              return !hints.contains("password")
+                  && ["apple account", "apple id", "email", "phone number"].contains { hints.contains($0) }
+          }
+          print("Identifiable account field count: \(candidates.count)")
+          guard candidates.count == 1, let field = candidates.first,
+                CGPreflightPostEventAccess(),
+                (attribute(field, kAXValueAttribute) as? String) == "",
+                AXUIElementSetAttributeValue(field, kAXFocusedAttribute as CFString, kCFBooleanTrue) == .success,
+                (attribute(field, kAXFocusedAttribute) as? Bool) == true else {
+              print("Stage: no unambiguous, empty, focused account field. No credentials or text sent.")
+              exit(EXIT_SUCCESS)
+          }
+
+          let marker = "imochige-test@example.invalid"
+          let units = Array(marker.utf16)
+          guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
+                let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else {
+              exit(EXIT_FAILURE)
+          }
+          units.withUnsafeBufferPointer {
+              down.keyboardSetUnicodeString(stringLength: $0.count, unicodeString: $0.baseAddress)
+          }
+          down.postToPid(app.processIdentifier)
+          up.postToPid(app.processIdentifier)
+          RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+          let confirmed = (attribute(field, kAXValueAttribute) as? String) == marker
+          print("Synthetic account field value verified: \(confirmed)")
+          if confirmed {
+              for (key, flags) in [(kVK_ANSI_A, CGEventFlags.maskCommand), (kVK_Delete, CGEventFlags())] {
+                  let keyDown = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(key), keyDown: true)
+                  let keyUp = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(key), keyDown: false)
+                  keyDown?.flags = flags
+                  keyUp?.flags = flags
+                  keyDown?.postToPid(app.processIdentifier)
+                  keyUp?.postToPid(app.processIdentifier)
+              }
+              RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+              print("Synthetic account field cleared: \((attribute(field, kAXValueAttribute) as? String) == "")")
+          }
+          print("Stage: synthetic UI input check. Apple login unattempted.")
           SWIFT
           swift "$work/probe.swift" "$bundle_id"
