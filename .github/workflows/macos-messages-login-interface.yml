@@ -158,28 +158,63 @@ jobs:
           }
 
           func reportSurface(_ nodes: [AXUIElement], source: String) {
-              let labels = nodes.map(label)
+              let labels = nodes.map { node in
+                  let staticText = (attribute(node, kAXRoleAttribute) as? String) == kAXStaticTextRole
+                      ? (attribute(node, kAXValueAttribute) as? String ?? "") : ""
+                  return label(node) + " " + staticText.lowercased()
+              }
               let signals = ["apple account", "sign in", "unable", "not available", "email", "phone number"]
                   .filter { signal in labels.contains { $0.contains(signal) } }
               print("\(source) surface: \(nodes.count) controls; known login signals: \(signals.joined(separator: ", "))")
           }
 
           func openSignInEntry(_ nodes: [AXUIElement], source: String) -> [AXUIElement] {
-              guard let entry = nodes.first(where: { node in
-                  let role = attribute(node, kAXRoleAttribute) as? String
-                  let title = (attribute(node, kAXTitleAttribute) as? String
-                      ?? attribute(node, kAXDescriptionAttribute) as? String ?? "")
-                      .lowercased().trimmingCharacters(in: CharacterSet(charactersIn: " .…"))
-                  return (role == kAXButtonRole || role == "AXLink")
-                      && ["sign in", "sign in to your apple account", "sign in to apple account"].contains(title)
-              }) else {
-                  print("\(source) sign-in entry not exposed.")
+              let titles = ["sign in", "sign in to your apple account", "sign in to apple account",
+                            "sign in with your apple account", "sign in with apple account"]
+              let matches = nodes.filter { node in
+                  var attributes = [kAXTitleAttribute, kAXDescriptionAttribute]
+                  if (attribute(node, kAXRoleAttribute) as? String) == kAXStaticTextRole {
+                      attributes.append(kAXValueAttribute)
+                  }
+                  return attributes.compactMap { attribute(node, $0) as? String }.contains { value in
+                      titles.contains(value.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: " .…")))
+                  }
+              }
+              var entries: [AXUIElement] = []
+              for match in matches {
+                  var node = match
+                  var roles: [String] = []
+                  for _ in 0..<4 {
+                      let role = attribute(node, kAXRoleAttribute) as? String ?? ""
+                      roles.append(role)
+                      var actions: CFArray?
+                      if AXUIElementCopyActionNames(node, &actions) == .success,
+                         (actions as? [String])?.contains(kAXPressAction) == true,
+                         (attribute(node, kAXEnabledAttribute) as? Bool) != false {
+                          if !entries.contains(where: { CFEqual($0, node) }) { entries.append(node) }
+                          break
+                      }
+                      guard role != kAXWindowRole,
+                            let parent = attribute(node, kAXParentAttribute),
+                            CFGetTypeID(parent) == AXUIElementGetTypeID() else { break }
+                      node = unsafeDowncast(parent, to: AXUIElement.self)
+                  }
+                  print("\(source) sign-in label roles: \(roles.joined(separator: " / "))")
+              }
+              print("\(source) sign-in action candidate count: \(entries.count)")
+              guard entries.count == 1, let entry = entries.first else {
                   return nodes
               }
               let result = AXUIElementPerformAction(entry, kAXPressAction as CFString)
               print("\(source) sign-in entry action: \(result.rawValue)")
-              RunLoop.current.run(until: Date().addingTimeInterval(3))
-              return descendants(waitForWindows())
+              var currentNodes = nodes
+              for _ in 0..<16 {
+                  RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+                  currentNodes = descendants(waitForWindows())
+                  if !accountFields(currentNodes).isEmpty { break }
+              }
+              reportSurface(currentNodes, source: "\(source) after sign-in action")
+              return currentNodes
           }
 
           var nodes = descendants(windows)
