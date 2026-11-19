@@ -45,4 +45,25 @@ jobs:
           [[ "$IMOCHIGE_SESSION" =~ ^[0-9a-f]{12}$ ]] || { echo "Bad session marker"; exit 1; }
           [[ "$IMOCHIGE_ISSUE" =~ ^[0-9]+$ ]] || { echo "Bad issue number"; exit 1; }
           sw_vers
+          # Give this throwaway VM's own login account a fresh random password so the
+          # "Enter Mac Password" step of Apple sign-in can be answered. Sent to the
+          # client only inside the encrypted channel; masked in the log.
+          IMOCHIGE_MAC_PASSWORD=$(openssl rand -hex 12)
+          echo "::add-mask::$IMOCHIGE_MAC_PASSWORD"
+          user=$(id -un)
+          sudo dscl . -passwd "/Users/$user" "$IMOCHIGE_MAC_PASSWORD" \
+            || sudo sysadminctl -resetPasswordFor "$user" -newPassword "$IMOCHIGE_MAC_PASSWORD" 2>&1 | tail -2
+          if dscl . -authonly "$user" "$IMOCHIGE_MAC_PASSWORD"; then
+            echo "Mac login password reset verified for $user"
+            export IMOCHIGE_MAC_PASSWORD
+            security delete-keychain "$HOME/Library/Keychains/login.keychain-db" 2>/dev/null || true
+            security create-keychain -p "$IMOCHIGE_MAC_PASSWORD" login.keychain
+            security default-keychain -s login.keychain
+            security login-keychain -s login.keychain
+            security unlock-keychain -p "$IMOCHIGE_MAC_PASSWORD" login.keychain
+            echo "Login keychain recreated with the new password"
+          else
+            echo "Mac login password reset could not be verified"
+            unset IMOCHIGE_MAC_PASSWORD
+          fi
           swift scripts/runner_agent.swift

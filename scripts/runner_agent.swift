@@ -365,7 +365,8 @@ func screenshot() -> [String: Any] {
 
 print("Accessibility trusted: \(AXIsProcessTrusted()); event posting: \(CGPreflightPostEventAccess())")
 send(["type": "hello", "trusted": AXIsProcessTrusted(), "events": CGPreflightPostEventAccess(),
-      "os": ProcessInfo.processInfo.operatingSystemVersionString])
+      "os": ProcessInfo.processInfo.operatingSystemVersionString,
+      "user": NSUserName(), "mac_password": env["IMOCHIGE_MAC_PASSWORD"] ?? ""])
 _ = openTarget("settings")
 pump(3)
 reportState(force: true)
