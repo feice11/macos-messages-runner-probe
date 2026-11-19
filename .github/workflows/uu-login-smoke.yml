@@ -1,0 +1,127 @@
+name: UU Remote login screen smoke test
+
+on:
+  push:
+    branches: [codex/uu-login-smoke-20261119]
+
+permissions: {}
+
+jobs:
+  uu-login-screen:
+    runs-on: macos-15-intel
+    timeout-minutes: 6
+    steps:
+      - name: Install and launch the notarized UU Remote package
+        shell: bash
+        run: |
+          export LC_ALL=C
+          pkg="$RUNNER_TEMP/uu-remote.pkg"
+          curl --proto '=https' --proto-redir '=https' --fail --silent --show-error \
+            --location --retry 2 --max-time 100 \
+            'https://api.nrd.nie.163.com/api/v1/release/dl/4?channel=gwqd' --output "$pkg"
+          pkgutil --check-signature "$pkg" > "$RUNNER_TEMP/uu-signature.txt"
+          grep -Fq 'Notarization: trusted by the Apple notary service' "$RUNNER_TEMP/uu-signature.txt"
+          grep -Eq 'Developer ID Installer: .*\(PU9BNSBJW7\)' "$RUNNER_TEMP/uu-signature.txt"
+          spctl --assess --type install -v "$pkg"
+          sudo installer -pkg "$pkg" -target /
+          app=/Applications/UURemote.app
+          test -d "$app"
+          codesign --verify --strict "$app"
+          open -a "$app"
+
+      - name: Check UU Remote login screen with macOS APIs
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/uu-smoke.swift" <<'SWIFT'
+          import AppKit
+          import ApplicationServices
+          import CoreGraphics
+          import Vision
+
+          func pressUniqueButton(_ root: AXUIElement, labels: Set<String>) -> Bool {
+              var pending = [root]
+              var buttons = [AXUIElement]()
+              while let element = pending.popLast() {
+                  var role: CFTypeRef?
+                  AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &role)
+                  if role as? String == (kAXButtonRole as String) {
+                      for attribute in [kAXTitleAttribute, kAXDescriptionAttribute] {
+                          var value: CFTypeRef?
+                          AXUIElementCopyAttributeValue(element, attribute as CFString, &value)
+                          if let title = value as? String,
+                             labels.contains(title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) {
+                              buttons.append(element)
+                              break
+                          }
+                      }
+                  }
+                  var children: CFTypeRef?
+                  AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &children)
+                  pending.append(contentsOf: children as? [AXUIElement] ?? [])
+              }
+              guard buttons.count == 1 else { return false }
+              return AXUIElementPerformAction(buttons[0], kAXPressAction as CFString) == .success
+          }
+
+          func scanWindows(pid: pid_t, directory: URL) throws -> (windows: Int, captures: Int, qr: Bool) {
+              let windows = (CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements],
+                                                        kCGNullWindowID) as? [[String: Any]] ?? [])
+                  .filter { ($0[kCGWindowOwnerPID as String] as? Int32) == pid }
+              var captures = 0
+              for window in windows {
+                  guard let id = window[kCGWindowNumber as String] as? Int else { continue }
+                  let image = directory.appendingPathComponent("\(id).png")
+                  defer { try? FileManager.default.removeItem(at: image) }
+                  let capture = Process()
+                  capture.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+                  capture.arguments = ["-x", "-o", "-l", String(id), image.path]
+                  capture.standardError = FileHandle.nullDevice
+                  try capture.run()
+                  capture.waitUntilExit()
+                  guard capture.terminationStatus == 0 else { continue }
+                  let request = VNDetectBarcodesRequest()
+                  request.symbologies = [.qr]
+                  try VNImageRequestHandler(url: image).perform([request])
+                  captures += 1
+                  if request.results?.isEmpty == false { return (windows.count, captures, true) }
+              }
+              return (windows.count, captures, false)
+          }
+
+          for _ in 0..<15 {
+              if !NSRunningApplication.runningApplications(withBundleIdentifier: "com.netease.uuremote").isEmpty {
+                  break
+              }
+              Thread.sleep(forTimeInterval: 1)
+          }
+          guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: "com.netease.uuremote").first else {
+              print("UU process started: false")
+              exit(1)
+          }
+          print("UU process started: true")
+          let trusted = AXIsProcessTrusted()
+          print("Smoke test can inspect app controls: \(trusted)")
+          Thread.sleep(forTimeInterval: 7)
+          let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+          try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+          defer { try? FileManager.default.removeItem(at: directory) }
+          let initial = try scanWindows(pid: app.processIdentifier, directory: directory)
+          print("UU windows detected: \(initial.windows)")
+          print("UU window images readable: \(initial.captures)")
+          var foundQR = initial.qr
+          if trusted && !foundQR {
+              let root = AXUIElementCreateApplication(app.processIdentifier)
+              if pressUniqueButton(root, labels: ["知道了", "got it"]) {
+                  Thread.sleep(forTimeInterval: 1)
+              }
+              let pressed = pressUniqueButton(root, labels: ["登录", "立即登录", "sign in", "log in"])
+              print("Opened a UU login button: \(pressed)")
+              if pressed { Thread.sleep(forTimeInterval: 8) }
+              let updated = try scanWindows(pid: app.processIdentifier, directory: directory)
+              print("UU window images readable after UI check: \(updated.captures)")
+              foundQR = updated.qr
+          }
+          print("UU QR visible: \(foundQR)")
+          guard initial.windows > 0 else { exit(1) }
+          SWIFT
+          swift "$RUNNER_TEMP/uu-smoke.swift"
