@@ -50,3 +50,59 @@ jobs:
 
           print("Stage: public scripting interface inspection. Apple login unattempted.")
           PY
+
+      - name: Check permission to access the official login window
+        shell: bash
+        run: |
+          app=/System/Applications/Messages.app
+          bundle_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")
+          open "$app"
+          work=$(mktemp -d)
+          trap 'rm -f "$work/probe.swift"; rmdir "$work"' EXIT
+          cat > "$work/probe.swift" <<'SWIFT'
+          import AppKit
+          import ApplicationServices
+          import CoreGraphics
+          import Darwin
+
+          let trusted = AXIsProcessTrusted()
+          print("Accessibility client trusted: \(trusted)")
+          print("Keyboard event posting authorized: \(CGPreflightPostEventAccess())")
+          guard trusted else {
+              print("Stage: stopped before reading or interacting with login controls.")
+              exit(EXIT_SUCCESS)
+          }
+          guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: CommandLine.arguments[1]).first else {
+              print("Stage: Messages process not found.")
+              exit(EXIT_FAILURE)
+          }
+
+          func attribute(_ node: AXUIElement, _ name: String) -> CFTypeRef? {
+              var value: CFTypeRef?
+              return AXUIElementCopyAttributeValue(node, name as CFString, &value) == .success ? value : nil
+          }
+
+          let application = AXUIElementCreateApplication(app.processIdentifier)
+          let windows = attribute(application, kAXWindowsAttribute) as? [AXUIElement] ?? []
+          print("Accessible Messages window count: \(windows.count)")
+          var queue = windows
+          var next = 0
+          var fields = 0
+          var editable = 0
+          while next < min(queue.count, 500) {
+              let node = queue[next]
+              next += 1
+              if (attribute(node, kAXRoleAttribute) as? String) == kAXTextFieldRole {
+                  fields += 1
+                  var settable = DarwinBoolean(false)
+                  if AXUIElementIsAttributeSettable(node, kAXValueAttribute as CFString, &settable) == .success,
+                     settable.boolValue {
+                      editable += 1
+                  }
+              }
+              queue.append(contentsOf: attribute(node, kAXChildrenAttribute) as? [AXUIElement] ?? [])
+          }
+          print("Exposed text field count: \(fields); writable: \(editable)")
+          print("Stage: read-only UI inspection. No field values read and no input sent.")
+          SWIFT
+          swift "$work/probe.swift" "$bundle_id"
