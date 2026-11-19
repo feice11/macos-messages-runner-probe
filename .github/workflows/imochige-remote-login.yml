@@ -1,0 +1,43 @@
+name: iMochige remote Apple sign-in
+run-name: iMochige remote sign-in ${{ inputs.session_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_id:
+        description: Session marker (12 lowercase hex digits)
+        type: string
+        required: true
+      issue:
+        description: Issue number used as the encrypted message channel
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: imochige-remote-login
+  cancel-in-progress: false
+
+jobs:
+  sign-in:
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts
+      - name: Run the encrypted sign-in agent
+        shell: bash
+        env:
+          IMOCHIGE_KEY: ${{ secrets.IMOCHIGE_SESSION_KEY }}
+          IMOCHIGE_SESSION: ${{ inputs.session_id }}
+          IMOCHIGE_ISSUE: ${{ inputs.issue }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [[ "$IMOCHIGE_SESSION" =~ ^[0-9a-f]{12}$ ]] || { echo "Bad session marker"; exit 1; }
+          [[ "$IMOCHIGE_ISSUE" =~ ^[0-9]+$ ]] || { echo "Bad issue number"; exit 1; }
+          sw_vers
+          swift scripts/runner_agent.swift
