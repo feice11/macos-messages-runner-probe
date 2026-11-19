@@ -141,7 +141,7 @@ func watchedApps() -> [NSRunningApplication] {
     }
 }
 
-struct Element { let node: AXUIElement; let app: NSRunningApplication; let kind: String }
+struct Element { let node: AXUIElement; let app: NSRunningApplication; let kind: String; let name: String }
 var elements: [Element] = []
 var lastStateJSON = ""
 
@@ -171,7 +171,7 @@ func snapshot() -> [String: Any] {
                     let secure = subrole == "AXSecureTextField"
                     let value = string(node, kAXValueAttribute)
                     let count = attribute(node, kAXNumberOfCharactersAttribute) as? Int ?? value.count
-                    elements.append(Element(node: node, app: app, kind: "field"))
+                    elements.append(Element(node: node, app: app, kind: "field", name: label))
                     var field: [String: Any] = ["id": elements.count - 1, "label": label, "secure": secure,
                                                 "search": subrole == "AXSearchField", "length": count,
                                                 "focused": (attribute(node, kAXFocusedAttribute) as? Bool) == true,
@@ -188,8 +188,9 @@ func snapshot() -> [String: Any] {
                             .map { string($0, kAXValueAttribute) }.filter { !$0.isEmpty }.joined(separator: " ")
                     }
                     guard !name.isEmpty, buttons.count < 80 else { continue }
-                    elements.append(Element(node: node, app: app, kind: "button"))
-                    var button: [String: Any] = ["id": elements.count - 1, "title": String(name.prefix(120)),
+                    name = String(name.prefix(120))
+                    elements.append(Element(node: node, app: app, kind: "button", name: name))
+                    var button: [String: Any] = ["id": elements.count - 1, "title": name,
                                                  "role": r, "enabled": enabled]
                     if r == kAXCheckBoxRole || r == kAXRadioButtonRole {
                         button["value"] = attribute(node, kAXValueAttribute) as? Int ?? 0
@@ -212,14 +213,17 @@ var lastStatePost = Date.distantPast
 func reportState(force: Bool = false) {
     let state = snapshot()
     // Compare without volatile focus/activation flags so an unchanged UI is not re-posted.
+    // Content signature only: element order inside Apple's views can shuffle between reads.
     let windows = (state["windows"] as? [[String: Any]] ?? []).map { window -> String in
-        var copy = window
-        copy["active"] = nil
-        copy["fields"] = (window["fields"] as? [[String: Any]] ?? []).map { field -> [String: Any] in
-            var f = field; f["focused"] = nil; return f
-        }
-        let data = (try? JSONSerialization.data(withJSONObject: copy, options: [.sortedKeys])) ?? Data()
-        return String(data: data, encoding: .utf8) ?? ""
+        let texts = (window["texts"] as? [String] ?? []).sorted()
+        let fields = (window["fields"] as? [[String: Any]] ?? []).map { f in
+            "\(f["label"] ?? "")|\(f["secure"] ?? "")|\(f["length"] ?? "")|\(f["value"] ?? "")|\(f["enabled"] ?? "")"
+        }.sorted()
+        let buttons = (window["buttons"] as? [[String: Any]] ?? []).map { b in
+            "\(b["title"] ?? "")|\(b["enabled"] ?? "")|\(b["value"] ?? "")"
+        }.sorted()
+        return ([window["app"] as? String ?? "", window["title"] as? String ?? ""] + texts + fields + buttons)
+            .joined(separator: "\u{1}")
     }
     let json = windows.joined(separator: "\n")
     guard force || (json != lastStateJSON && Date().timeIntervalSince(lastStatePost) >= 2.5) else { return }
@@ -381,7 +385,18 @@ while running {
             let id = command["id"] as? Int ?? -1
             print("Handling command op=\(op)")
             var result: [String: Any] = ["ok": false]
-            let element = (0..<elements.count).contains(id) ? elements[id] : nil
+            var element = (0..<elements.count).contains(id) ? elements[id] : nil
+            // Element ids are positional; confirm by name and re-resolve if Apple's view reordered.
+            if let match = command["match"] as? String, !match.isEmpty {
+                func name(_ e: Element) -> String { e.name }
+                if element == nil || element!.name != match {
+                    _ = snapshot()
+                    let kind = op == "press" ? "button" : "field"
+                    let found = elements.filter { $0.kind == kind && name($0) == match }
+                    element = found.count == 1 ? found[0] : nil
+                    print("Re-resolved element by name: \(found.count) match(es)")
+                }
+            }
             switch op {
             case "snapshot":
                 reportState(force: true)
