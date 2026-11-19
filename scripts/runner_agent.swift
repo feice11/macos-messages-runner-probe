@@ -226,10 +226,12 @@ func reportState(force: Bool = false) {
             .joined(separator: "\u{1}")
     }
     let json = windows.joined(separator: "\n")
-    guard force || (json != lastStateJSON && Date().timeIntervalSince(lastStatePost) >= 2.5) else { return }
+    guard force || (json != lastStateJSON && Date().timeIntervalSince(lastStatePost) >= 10) else { return }
     if !force {
-        let changed = windows.indices.filter { $0 >= lastStateWindows.count || lastStateWindows[$0] != windows[$0] }
-        print("State changed: windows \(lastStateWindows.count) -> \(windows.count), differing indices \(changed)")
+        // Diagnostics only: part counts, no content.
+        let old = Set(lastStateJSON.components(separatedBy: CharacterSet(charactersIn: "\u{1}\n")))
+        let new = Set(json.components(separatedBy: CharacterSet(charactersIn: "\u{1}\n")))
+        print("State changed: parts \(old.count) -> \(new.count), added \(new.subtracting(old).count), removed \(old.subtracting(new).count)")
     }
     lastStateJSON = json
     lastStateWindows = windows
