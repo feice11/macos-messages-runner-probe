@@ -1,0 +1,61 @@
+name: macOS Messages preflight
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  probe:
+    runs-on: macos-15
+    timeout-minutes: 2
+    steps:
+      - name: Check macOS and Messages
+        shell: bash
+        run: |
+          version=$(sw_vers -productVersion)
+          architecture=$(uname -m)
+          printf 'macOS %s (%s)\n' "$version" "$architecture"
+          [[ "$architecture" == arm64 && "${version%%.*}" -ge 15 ]]
+          app=/System/Applications/Messages.app
+          test -x "$app/Contents/MacOS/Messages"
+          codesign --verify -- "$app"
+          if launchctl print "gui/$(id -u)" >/dev/null 2>&1; then
+            printf '%s\n' 'Runner user has a GUI session.'
+          else
+            printf '%s\n' 'Runner user has no GUI session.'
+          fi
+
+      - name: Check Apple endpoint TLS
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import concurrent.futures
+          import json
+          import socket
+          import ssl
+
+          endpoints = (
+              ("gsa.apple.com", 443),
+              ("courier.push.apple.com", 5223),
+              ("courier.push.apple.com", 443),
+          )
+
+          def probe(endpoint):
+              host, port = endpoint
+              result = {"host": host, "port": port, "tcp": False, "tls": None}
+              try:
+                  with socket.create_connection(endpoint, timeout=5) as connection:
+                      result["tcp"] = True
+                      context = ssl.create_default_context()
+                      with context.wrap_socket(connection, server_hostname=host) as session:
+                          result["tls"] = session.version()
+              except OSError as error:
+                  result["error"] = str(error)
+              return result
+
+          with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+              for result in executor.map(probe, endpoints):
+                  print(json.dumps(result, sort_keys=True))
+          print("Stage: transport preflight. Apple account and IDS registration untested.")
+          PY
