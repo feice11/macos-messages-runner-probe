@@ -34,8 +34,12 @@ jobs:
               name = command.attrib["name"]
               names.append(name)
               if auth.search(name):
+                  direct = command.find("direct-parameter")
+                  direct_type = direct.attrib.get("type", "(unspecified)") if direct is not None else "(none)"
                   parameters = [parameter.attrib["name"] for parameter in command.findall("parameter")]
-                  print(f"Authentication-related command: {name}; parameters: {', '.join(parameters) or '(none)'}")
+                  print(f"Authentication-related command: {name}; direct parameter: {direct_type}; "
+                        f"named parameters: {', '.join(parameters) or '(none)'}")
+                  print(f"Command description: {command.attrib.get('description', '(none)')}")
           print("Declared commands:", ", ".join(sorted(set(names))))
 
           for item in root.findall(".//class"):
