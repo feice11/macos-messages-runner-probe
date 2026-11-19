@@ -26,36 +26,67 @@ jobs:
             printf '%s\n' 'Runner user has no GUI session.'
           fi
 
-      - name: Check Apple endpoint TLS
+      - name: Launch official Messages and check Screen Sharing
         shell: bash
         run: |
-          python3 - <<'PY'
-          import concurrent.futures
-          import json
-          import socket
-          import ssl
+          open /System/Applications/Messages.app
+          for attempt in {1..10}; do
+            if pgrep -x Messages >/dev/null; then
+              printf '%s\n' 'Apple Messages process is running.'
+              break
+            fi
+            sleep 1
+          done
+          pgrep -x Messages >/dev/null
+          if nc -z -G 2 127.0.0.1 5900; then
+            printf '%s\n' 'Screen Sharing port is listening on loopback.'
+          else
+            printf '%s\n' 'Screen Sharing port is not listening on loopback.'
+          fi
 
-          endpoints = (
-              ("gsa.apple.com", 443),
-              ("courier.push.apple.com", 5223),
-              ("courier.push.apple.com", 443),
-          )
+      - name: Check Apple endpoint TLS with macOS Network.framework
+        shell: bash
+        run: |
+          work=$(mktemp -d)
+          trap 'rm -f "$work/probe.swift"; rmdir "$work"' EXIT
+          cat > "$work/probe.swift" <<'SWIFT'
+          import Dispatch
+          import Network
+          import Security
 
-          def probe(endpoint):
-              host, port = endpoint
-              result = {"host": host, "port": port, "tcp": False, "tls": None}
-              try:
-                  with socket.create_connection(endpoint, timeout=5) as connection:
-                      result["tcp"] = True
-                      context = ssl.create_default_context()
-                      with context.wrap_socket(connection, server_hostname=host) as session:
-                          result["tls"] = session.version()
-              except OSError as error:
-                  result["error"] = str(error)
-              return result
+          func probe(host: String, port: UInt16) {
+              let tls = NWProtocolTLS.Options()
+              host.withCString {
+                  sec_protocol_options_set_tls_server_name(tls.securityProtocolOptions, $0)
+              }
+              let connection = NWConnection(
+                  host: NWEndpoint.Host(host),
+                  port: NWEndpoint.Port(rawValue: port)!,
+                  using: NWParameters(tls: tls, tcp: NWProtocolTCP.Options())
+              )
+              let settled = DispatchSemaphore(value: 0)
+              connection.stateUpdateHandler = { state in
+                  switch state {
+                  case .ready:
+                      print("\(host):\(port) TLS verified")
+                      settled.signal()
+                  case .waiting(let error), .failed(let error):
+                      print("\(host):\(port) TLS unavailable (\(error))")
+                      settled.signal()
+                  default:
+                      break
+                  }
+              }
+              connection.start(queue: DispatchQueue(label: "messages-tls-preflight"))
+              if settled.wait(timeout: .now() + 7) == .timedOut {
+                  print("\(host):\(port) TLS timed out")
+              }
+              connection.cancel()
+          }
 
-          with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-              for result in executor.map(probe, endpoints):
-                  print(json.dumps(result, sort_keys=True))
-          print("Stage: transport preflight. Apple account and IDS registration untested.")
-          PY
+          probe(host: "gsa.apple.com", port: 443)
+          probe(host: "courier.push.apple.com", port: 5223)
+          probe(host: "courier.push.apple.com", port: 443)
+          print("Stage: application launch and transport check. Apple login and IDS registration untested.")
+          SWIFT
+          swift "$work/probe.swift"
