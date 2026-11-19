@@ -44,8 +44,11 @@ jobs:
               while let element = pending.popLast() {
                   var role: CFTypeRef?
                   AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &role)
-                  if role as? String == (kAXButtonRole as String) {
-                      for attribute in [kAXTitleAttribute, kAXDescriptionAttribute] {
+                  var actions: CFArray?
+                  AXUIElementCopyActionNames(element, &actions)
+                  if role as? String == (kAXButtonRole as String) ||
+                      (actions as? [String] ?? []).contains(kAXPressAction as String) {
+                      for attribute in [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute] {
                           var value: CFTypeRef?
                           AXUIElementCopyAttributeValue(element, attribute as CFString, &value)
                           if let title = value as? String,
@@ -89,11 +92,9 @@ jobs:
           }
 
           func clickVisibleLogin(_ app: NSRunningApplication, directory: URL) throws -> Bool {
-              guard CGPreflightPostEventAccess(),
-                    NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier else {
-                  print("UU is not the active app or this test lacks input permission")
-                  return false
-              }
+              let canPost = CGPreflightPostEventAccess()
+              print("Smoke test can send input: \(canPost)")
+              print("UU is the active app: \(NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier)")
               let windows = (CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements],
                                                         kCGNullWindowID) as? [[String: Any]] ?? [])
               let labels: Set<String> = [
@@ -101,7 +102,7 @@ jobs:
                   "登录/注册", "注册/登录", "登录注册", "账号登录", "扫码登录", "微信登录",
                   "signin", "login", "signuptologin"
               ]
-              var matches = [(label: String, point: CGPoint)]()
+              var matches = [(label: String, point: CGPoint, window: Int)]()
               for window in windows {
                   guard window[kCGWindowOwnerPID as String] as? Int32 == app.processIdentifier,
                         window[kCGWindowLayer as String] as? Int == 0,
@@ -127,12 +128,21 @@ jobs:
                       guard labels.contains(label) else { continue }
                       let box = observation.boundingBox
                       matches.append((label, CGPoint(x: frame.minX + box.midX * frame.width,
-                                                     y: frame.minY + (1 - box.midY) * frame.height)))
+                                                     y: frame.minY + (1 - box.midY) * frame.height), id))
                   }
               }
               print("UU login labels recognized: \(matches.map(\.label).joined(separator: ", "))")
-              guard matches.count == 1, let point = matches.first?.point,
-                    NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier,
+              guard canPost, matches.count == 1, let match = matches.first else { return false }
+              let point = match.point
+              let currentWindows = (CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements],
+                                                              kCGNullWindowID) as? [[String: Any]] ?? [])
+              let visibleWindow = currentWindows.first { window in
+                  guard let bounds = window[kCGWindowBounds as String] as? NSDictionary,
+                        let frame = CGRect(dictionaryRepresentation: bounds as CFDictionary),
+                        (window[kCGWindowAlpha as String] as? Double ?? 1) > 0 else { return false }
+                  return frame.contains(point)
+              }
+              guard visibleWindow?[kCGWindowNumber as String] as? Int == match.window,
                     let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown,
                                        mouseCursorPosition: point, mouseButton: .left),
                     let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp,
@@ -168,12 +178,15 @@ jobs:
               if pressUniqueButton(root, labels: ["知道了", "got it"]) {
                   Thread.sleep(forTimeInterval: 1)
               }
-              let pressed = pressUniqueButton(root, labels: ["登录", "立即登录", "sign in", "log in"])
+              let pressed = pressUniqueButton(root, labels: [
+                  "登录", "立即登录", "点击登录", "登录账号", "去登录", "登录/注册",
+                  "注册/登录", "扫码登录", "微信登录", "sign in", "log in"
+              ])
               print("Opened a UU login button: \(pressed)")
               var loginOpened = pressed
               if !pressed {
                   app.activate()
-                  Thread.sleep(forTimeInterval: 2)
+                  RunLoop.current.run(until: Date().addingTimeInterval(2))
                   loginOpened = try clickVisibleLogin(app, directory: directory)
                   print("Clicked a visible UU login label: \(loginOpened)")
               }
