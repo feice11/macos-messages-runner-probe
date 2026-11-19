@@ -8,9 +8,12 @@ pkg="$work/uu.pkg"
 curl -fsSL --retry 3 -o "$pkg" "https://api.nrd.nie.163.com/api/v1/release/dl/4?channel=gwqd" || { echo "UU download failed"; exit 1; }
 ls -l "$pkg"
 pkgutil --check-signature "$pkg" | tee "$work/sig.txt"
+# Pinned to the Developer ID team that signs the pkg served by the official
+# uuyc.163.com download button (via adl.netease.com / gdl.netease.com), notarized by Apple.
 grep -q "signed by a developer certificate issued by Apple" "$work/sig.txt" \
-  && grep -qi "netease" "$work/sig.txt" \
-  || { echo "UU package signature is not a NetEase Developer ID; refusing to install."; exit 1; }
+  && grep -q "Notarization: trusted by the Apple notary service" "$work/sig.txt" \
+  && grep -q "Developer ID Installer: .*(PU9BNSBJW7)" "$work/sig.txt" \
+  || { echo "UU package is not the expected notarized Developer ID (team PU9BNSBJW7); refusing to install."; exit 1; }
 spctl --assess --type install -vv "$pkg" 2>&1 | tail -2
 
 before=$(ls /Applications)
