@@ -184,7 +184,9 @@ jobs:
                   return label(node) + " " + staticText.lowercased()
               }
               let signals = ["apple account", "sign in", "unable", "not available", "email", "phone number",
-                             "could not connect", "connection failed", "enter", "continue", "cancel", "try again"]
+                             "could not connect", "connection failed", "enter", "continue", "cancel", "try again",
+                             "use another apple device", "nearby device", "passkey", "qr code", "sign in with iphone",
+                             "sign in with your iphone", "other sign-in options", "security key"]
                   .filter { signal in labels.contains { $0.contains(signal) } }
               print("\(source) surface: \(nodes.count) controls; known login signals: \(signals.joined(separator: ", "))")
           }
@@ -211,6 +213,19 @@ jobs:
                   let empty = (attribute(field, kAXValueAttribute) as? String) == ""
                   print("\(source) sign-in text field: \(classification), focused: \(focused), empty: \(empty)")
               }
+          }
+
+          func reportAlternativeSignInActions(_ nodes: [AXUIElement], source: String) {
+              let hints = ["another apple device", "nearby device", "passkey", "qr code",
+                           "with iphone", "with your iphone", "other sign-in options", "security key"]
+              let matches = nodes.filter { node in
+                  var actions: CFArray?
+                  return hints.contains { label(node).contains($0) }
+                      && AXUIElementCopyActionNames(node, &actions) == .success
+                      && (actions as? [String])?.contains(kAXPressAction) == true
+                      && (attribute(node, kAXEnabledAttribute) as? Bool) != false
+              }
+              print("\(source) alternate Apple sign-in action count: \(matches.count)")
           }
 
           func openSignInEntry(_ nodes: [AXUIElement], source: String) -> [AXUIElement] {
@@ -276,6 +291,7 @@ jobs:
 
           if accountFields(nodes).isEmpty {
               reportSurface(nodes, source: "Messages")
+              reportAlternativeSignInActions(nodes, source: "Messages")
               nodes = openSignInEntry(nodes, source: "Messages")
           }
           if accountFields(nodes).isEmpty {
@@ -301,6 +317,7 @@ jobs:
                       }
                       for window in nodes.filter(isSignInWindow) {
                           reportSignInWindow(window, source: "System Settings")
+                          reportAlternativeSignInActions(descendants([window]), source: "System Settings")
                       }
                       if accountFields(nodes).isEmpty {
                           let authIdentifiers = ["appleid", "appleaccount", "authkit"]
