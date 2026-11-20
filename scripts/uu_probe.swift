@@ -81,23 +81,74 @@ while let e = stack.popLast(), seen < 300 {
     stack.append(contentsOf: c as? [AXUIElement] ?? [])
 }
 
-print("[click] targets=\(targets.map { "\($0.2)@\(Int($0.1.x)),\(Int($0.1.y))" })")
-if let t = targets.first {
-    let top = windows().first { w in
-        guard w[kCGWindowLayer as String] as? Int == 0, let bd = w[kCGWindowBounds as String] as? NSDictionary,
-              let f = CGRect(dictionaryRepresentation: bd as CFDictionary) else { return false }
-        return f.contains(t.1)
-    }
-    print("[click] topmost window at point: owner=\(top?[kCGWindowOwnerName as String] ?? "-") id=\(top?[kCGWindowNumber as String] ?? "-")")
-    for type in [CGEventType.mouseMoved, .leftMouseDown, .leftMouseUp] {
-        CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: t.1, mouseButton: .left)?.post(tap: .cghidEventTap)
-        pump(0.08)
-    }
-    for (i, wait) in [2.0, 4.0, 6.0, 10.0].enumerated() {
-        pump(wait - (i == 0 ? 0 : [2.0, 4.0, 6.0, 10.0][i - 1]))
-        let name = "03-after-\(Int(wait))s"
-        shot(name)
-        print("[after \(Int(wait))s] qr=\(qrOnScreen(name))")
-    }
-    dumpWindows("after")
+
+// ---- Round 2: drive everything through Accessibility geometry ----
+func ax(_ e: AXUIElement, _ a: String) -> CFTypeRef? { var v: CFTypeRef?; AXUIElementCopyAttributeValue(e, a as CFString, &v); return v }
+func axs(_ e: AXUIElement, _ a: String) -> String { ax(e, a) as? String ?? "" }
+func frameOf(_ e: AXUIElement) -> CGRect? {
+    guard let p = ax(e, kAXPositionAttribute), let z = ax(e, kAXSizeAttribute) else { return nil }
+    var pt = CGPoint.zero, sz = CGSize.zero
+    AXValueGetValue(p as! AXValue, .cgPoint, &pt); AXValueGetValue(z as! AXValue, .cgSize, &sz)
+    return CGRect(origin: pt, size: sz)
 }
+func all(_ root: AXUIElement, limit: Int = 1500) -> [AXUIElement] {
+    var out: [AXUIElement] = [], st = [root]
+    while let e = st.popLast(), out.count < limit {
+        out.append(e)
+        st.append(contentsOf: ax(e, kAXChildrenAttribute) as? [AXUIElement] ?? [])
+    }
+    return out
+}
+func label(_ e: AXUIElement) -> String { [axs(e, kAXTitleAttribute), axs(e, kAXValueAttribute), axs(e, kAXDescriptionAttribute)].first { !$0.isEmpty } ?? "" }
+func windowsOnly(_ root: AXUIElement) -> [AXUIElement] { ax(root, kAXWindowsAttribute) as? [AXUIElement] ?? [] }
+func dumpAX(_ tag: String) {
+    print("[ax \(tag)]")
+    for (i, w) in windowsOnly(root).enumerated() {
+        print("  window \(i) '\(axs(w, kAXTitleAttribute))' frame=\(frameOf(w).map { "\($0)" } ?? "-")")
+        for e in all(w) {
+            let r = axs(e, kAXRoleAttribute), l = label(e)
+            if r == kAXGroupRole as String && l.isEmpty { continue }
+            if ["AXScrollArea", "AXSplitGroup", "AXLayoutArea"].contains(r) && l.isEmpty { continue }
+            let v = ax(e, kAXValueAttribute).map { "\($0)" } ?? ""
+            print("    \(r) '\(l)' val=\(v.prefix(20)) frame=\(frameOf(e).map { "\(Int($0.midX)),\(Int($0.midY)) \(Int($0.width))x\(Int($0.height))" } ?? "-") enabled=\(ax(e, kAXEnabledAttribute) as? Bool ?? true)")
+        }
+    }
+}
+func find(_ text: String, roles: [String]? = nil) -> AXUIElement? {
+    all(root).first { e in
+        label(e).replacingOccurrences(of: " ", with: "").contains(text) && (roles == nil || roles!.contains(axs(e, kAXRoleAttribute)))
+    }
+}
+func click(_ p: CGPoint) {
+    for t in [CGEventType.mouseMoved, .leftMouseDown, .leftMouseUp] {
+        CGEvent(mouseEventSource: nil, mouseType: t, mouseCursorPosition: p, mouseButton: .left)?.post(tap: .cghidEventTap); pump(0.08)
+    }
+}
+func clickAX(_ e: AXUIElement, _ why: String) {
+    if let f = frameOf(e) { print("[click] \(why) at \(Int(f.midX)),\(Int(f.midY))"); click(CGPoint(x: f.midX, y: f.midY)) }
+    else { print("[click] \(why): no frame, AXPress=\(AXUIElementPerformAction(e, kAXPressAction as CFString).rawValue)") }
+}
+
+if let ok = find("知道了", roles: [kAXButtonRole as String]) {
+    print("[tip] AXPress 知道了 -> \(AXUIElementPerformAction(ok, kAXPressAction as CFString).rawValue)"); pump(1)
+}
+dumpWindows("after-tip")
+if let login = find("立即登录") {
+    clickAX(login, "立即登录")
+    for wait in [3.0, 5.0, 8.0] {
+        pump(wait == 3 ? 3 : (wait == 5 ? 2 : 3))
+        let n = "04-login-\(Int(wait))s"; shot(n); print("[login \(Int(wait))s] qr=\(qrOnScreen(n))")
+    }
+    dumpWindows("login"); dumpAX("login")
+} else { print("[login] 立即登录 not found in AX") }
+
+// Close whatever the login opened, then open Settings through the app menu.
+CGEvent(keyboardEventSource: nil, virtualKey: 0x35, keyDown: true)?.post(tap: .cghidEventTap)
+CGEvent(keyboardEventSource: nil, virtualKey: 0x35, keyDown: false)?.post(tap: .cghidEventTap); pump(1)
+let menuBar = ax(root, kAXMenuBarAttribute).map { $0 as! AXUIElement }
+let settingsItem = menuBar.flatMap { mb in all(mb).first { axs($0, kAXRoleAttribute) == kAXMenuItemRole as String && axs($0, kAXTitleAttribute).hasPrefix("设置") } }
+print("[settings] menu item found=\(settingsItem != nil) press=\(settingsItem.map { AXUIElementPerformAction($0, kAXPressAction as CFString).rawValue } ?? -1)")
+pump(3); shot("05-settings"); dumpWindows("settings"); dumpAX("settings")
+if let security = find("安全", roles: [kAXStaticTextRole as String, kAXButtonRole as String, "AXCell", "AXRow"]) {
+    clickAX(security, "安全"); pump(2); shot("06-security"); dumpAX("security")
+} else { print("[settings] 安全 not found") }
