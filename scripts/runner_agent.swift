@@ -529,6 +529,92 @@ func uuLogin() -> [String: Any] {
     return result
 }
 
+// MARK: - UU remote view (click on the picture to click on the Mac)
+
+func postClick(_ point: CGPoint) {
+    for type in [CGEventType.mouseMoved, .leftMouseDown, .leftMouseUp] {
+        CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: point, mouseButton: .left)?.post(tap: .cghidEventTap)
+        pump(type == .mouseMoved ? 0.1 : 0.05)
+    }
+}
+
+/// UU's largest normal window: the area the client sees and clicks on.
+func uuMainFrame(_ app: NSRunningApplication) -> CGRect? {
+    uuWindows(app).max { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }?.frame
+}
+
+/// Screen region of UU's main window, including menus and popovers drawn on top of it.
+func uuView(_ app: NSRunningApplication) -> [String: Any] {
+    guard let frame = uuMainFrame(app) else { return ["ok": false, "error": "No UU window on screen"] }
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("imochige-view-\(UUID().uuidString)")
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let raw = dir.appendingPathComponent("v.png").path, small = dir.appendingPathComponent("v.jpg").path
+    let region = "\(Int(frame.minX)),\(Int(frame.minY)),\(Int(frame.width)),\(Int(frame.height))"
+    for (tool, args) in [("/usr/sbin/screencapture", ["-x", "-R", region, raw]),
+                         ("/usr/bin/sips", ["-Z", "1000", "-s", "format", "jpeg", "-s", "formatOptions", "70", raw, "--out", small])] {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: tool)
+        process.arguments = args
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do { try process.run(); process.waitUntilExit() } catch { return ["ok": false, "error": "\(error)"] }
+    }
+    guard let data = FileManager.default.contents(atPath: small) else { return ["ok": false, "error": "Capture failed"] }
+    return ["ok": true, "jpeg": data.base64EncodedString(), "front": NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier]
+}
+
+/// Bring UU forward only when needed, so an open UU menu is not dismissed.
+func ensureUUFront() -> NSRunningApplication? {
+    guard let app = uuApp() else { return nil }
+    if NSWorkspace.shared.frontmostApplication?.processIdentifier != app.processIdentifier {
+        _ = bringUUToFront()
+    }
+    return app
+}
+
+func uuCommand(_ op: String, _ command: [String: Any]) -> [String: Any] {
+    if op == "uu_view" { _ = bringUUToFront() }
+    guard let app = ensureUUFront() else { return ["ok": false, "error": "UU Remote is not running in this session"] }
+    var note = ""
+    switch op {
+    case "uu_click":
+        if let fx = command["fx"] as? Double, let fy = command["fy"] as? Double, let frame = uuMainFrame(app) {
+            postClick(CGPoint(x: frame.minX + fx * frame.width, y: frame.minY + fy * frame.height))
+            note = "clicked point"
+        } else if let wanted = (command["text"] as? String)?.lowercased().filter({ !$0.isWhitespace }), !wanted.isEmpty,
+                  let frame = uuMainFrame(app) {
+            // Recognize text on the visible UU area, click the first label that contains the wanted text.
+            let shot = uuView(app)
+            guard let encoded = shot["jpeg"] as? String, let data = Data(base64Encoded: encoded) else { return shot }
+            let request = VNRecognizeTextRequest()
+            request.recognitionLanguages = ["zh-Hans", "en-US"]
+            try? VNImageRequestHandler(data: data).perform([request])
+            let hit = (request.results ?? []).first { observation in
+                (observation.topCandidates(1).first?.string ?? "").lowercased().filter { !$0.isWhitespace }.contains(wanted)
+            }
+            guard let hit else { return ["ok": false, "error": "Text not found on the UU window", "jpeg": encoded] }
+            let box = hit.boundingBox
+            postClick(CGPoint(x: frame.minX + box.midX * frame.width, y: frame.minY + (1 - box.midY) * frame.height))
+            note = "clicked \(hit.topCandidates(1).first?.string ?? "")"
+        } else { return ["ok": false, "error": "Missing click target"] }
+    case "uu_settings":
+        postKey(kVK_ANSI_Comma, flags: .maskCommand)
+        note = "pressed Cmd+,"
+    case "uu_key":
+        let map: [String: Int] = ["escape": kVK_Escape, "return": kVK_Return, "tab": kVK_Tab, "space": kVK_Space]
+        guard let code = map[command["key"] as? String ?? ""] else { return ["ok": false, "error": "Unknown key"] }
+        postKey(code)
+        note = "pressed key"
+    default:
+        break
+    }
+    pump(op == "uu_view" ? 0.3 : 1.5)
+    var result = uuView(app)
+    result["note"] = note
+    return result
+}
+
 // MARK: - Main loop
 
 print("Accessibility trusted: \(AXIsProcessTrusted()); event posting: \(CGPreflightPostEventAccess()); screen capture: \(CGPreflightScreenCaptureAccess())")
@@ -578,6 +664,8 @@ while running {
                 result = env["UU_APP"] != nil ? bringUUToFront() : ["ok": false, "error": "UU Remote was not installed in this session"]
             case "uu_login":
                 result = uuLogin()
+            case "uu_view", "uu_click", "uu_settings", "uu_key":
+                result = uuCommand(op, command)
             case "snapshot":
                 reportState(force: true)
                 result = ["ok": true]
