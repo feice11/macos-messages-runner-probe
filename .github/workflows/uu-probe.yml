@@ -1,0 +1,51 @@
+name: UU evidence probe
+
+on:
+  push:
+    branches: [claude/uu-probe]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: uu-probe
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts
+      - name: Install UU Remote (same script as the sign-in session)
+        run: bash scripts/install_uu.sh
+      - name: Look for the "allow same-account control" setting
+        shell: bash
+        run: |
+          app="${UU_APP:-/Applications/UURemote.app}"
+          echo "== defaults domains"; defaults domains | tr ',' '\n' | grep -iE 'uu|netease' || true
+          for d in com.netease.uuremote com.netease.uuremote.agent com.netease.uuremote.daemon; do echo "== defaults read $d"; defaults read "$d" 2>&1 | head -60; done
+          echo "== data dirs"; ls -la ~/Library/Application\ Support | grep -iE 'uu|netease' || true
+          find ~/Library /Library/Application\ Support -maxdepth 3 -iname '*uu*remote*' 2>/dev/null | head -40
+          echo "== strings mentioning same-account control"
+          grep -rl --include='*.strings' --include='*.json' --include='*.js' -e '同账号' -e 'allowSameAccount' "$app" 2>/dev/null | head -20
+          grep -rhoE '"[^"]{0,60}同账号[^"]{0,60}"[^,;]{0,120}' "$app" 2>/dev/null | head -20
+          strings "$app/Contents/MacOS/UURemote" "$app/Contents/MacOS/UURemoteService" 2>/dev/null | grep -iE 'allow.?(same|control)|beControl|be_control|controlled|SameAccount' | sort -u | head -40
+      - name: Drive the UU login screen and record every step
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/shots"
+          OUT="$RUNNER_TEMP/shots" swift scripts/uu_probe.swift
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shots-${{ matrix.runner }}
+          path: ${{ runner.temp }}/shots
+          retention-days: 1
