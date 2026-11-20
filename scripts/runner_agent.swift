@@ -677,14 +677,41 @@ func uuAllowControl(_ app: NSRunningApplication) -> [String: Any] {
     guard waitFor(8, { uuWindowNodes(app).contains { string($0, kAXTitleAttribute) == "设置" } }) else {
         return ["ok": false, "step": "settings", "error": "UU settings window did not open"]
     }
+    // The settings window opens behind UU's main window (seen in the self-test screenshot): raise it first.
+    func raiseSettings() {
+        if let win = uuWindowNodes(app).first(where: { string($0, kAXTitleAttribute) == "设置" }) {
+            AXUIElementSetAttributeValue(win, kAXMainAttribute as CFString, kCFBooleanTrue)
+            AXUIElementPerformAction(win, kAXRaiseAction as CFString)
+            pump(0.6)
+        }
+    }
+    raiseSettings()
     guard let tab = uuFind(app, "安全", role: kAXStaticTextRole as String, exact: true), clickNode(tab),
           waitFor(5, { uuToggle(app, row: "允许同账号控制本设备") != nil }),
           let toggle = uuToggle(app, row: "允许同账号控制本设备") else {
         return ["ok": false, "step": "security", "error": "Could not find the 允许同账号控制本设备 switch"]
     }
+    func isOn() -> Bool { (uuToggle(app, row: "允许同账号控制本设备").map(toggleValue) ?? 0) == 1 }
     if toggleValue(toggle) != 1 {
+        raiseSettings()
         _ = clickNode(toggle)
-        _ = waitFor(4) { (uuToggle(app, row: "允许同账号控制本设备").map(toggleValue) ?? 0) == 1 }
+        if !waitFor(3, isOn) {
+            // Not signed in: UU answers with "登录网易UU远程 / 登录后可允许同账户远控本机" (seen in the self-test).
+            if uuFind(app, "登录后可允许同账户远控本机") != nil {
+                if let cancel = uuFind(app, "取消", role: kAXButtonRole as String, exact: true) {
+                    AXUIElementPerformAction(cancel, kAXPressAction as CFString)
+                }
+                return ["ok": false, "step": "security", "needs_login": true,
+                        "error": "UU is not signed in, so the switch cannot be turned on yet"]
+            }
+            // Signed in: accept a confirmation dialog if UU shows one.
+            for title in ["确定", "开启", "立即开启", "允许", "同意", "确认"] {
+                if let button = uuFind(app, title, role: kAXButtonRole as String, exact: true) {
+                    AXUIElementPerformAction(button, kAXPressAction as CFString)
+                    if waitFor(3, isOn) { break }
+                }
+            }
+        }
     }
     let final = uuToggle(app, row: "允许同账号控制本设备").map(toggleValue) ?? -1
     // Capture the settings window as proof, including the permission warning if UU shows one.
