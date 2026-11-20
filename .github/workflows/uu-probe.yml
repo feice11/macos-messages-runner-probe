@@ -26,11 +26,13 @@ jobs:
       - name: Install UU Remote (same script as the sign-in session)
         run: bash scripts/install_uu.sh
       - name: Look for the "allow same-account control" setting
+        continue-on-error: true
         shell: bash
         run: |
+          set +e +o pipefail
           app="${UU_APP:-/Applications/UURemote.app}"
           echo "== defaults domains"; defaults domains | tr ',' '\n' | grep -iE 'uu|netease' || true
-          for d in com.netease.uuremote com.netease.uuremote.agent com.netease.uuremote.daemon; do echo "== defaults read $d"; defaults read "$d" 2>&1 | head -60; done
+          for d in com.netease.uuremote.server; do echo "== defaults read $d"; defaults read "$d" 2>&1 | head -60; done
           echo "== data dirs"; ls -la ~/Library/Application\ Support | grep -iE 'uu|netease' || true
           find ~/Library /Library/Application\ Support -maxdepth 3 -iname '*uu*remote*' 2>/dev/null | head -40
           echo "== strings mentioning same-account control"
