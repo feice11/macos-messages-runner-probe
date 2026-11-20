@@ -13,7 +13,10 @@ import Vision
 
 setvbuf(stdout, nil, _IOLBF, 0)
 let env = ProcessInfo.processInfo.environment
+// IMOCHIGE_SELFTEST=1: run the UU one-click flow locally without the GitHub channel, then exit.
+let selfTest = env["IMOCHIGE_SELFTEST"] == "1"
 func need(_ name: String) -> String {
+    if selfTest { return name == "IMOCHIGE_KEY" ? Data(count: 32).base64EncodedString() : "selftest" }
     guard let value = env[name], !value.isEmpty else { print("Missing \(name)"); exit(2) }
     return value
 }
@@ -55,9 +58,21 @@ func http(_ method: String, _ path: String, _ body: [String: Any]? = nil) -> (In
     return result
 }
 
+/// Message with long strings (images) replaced by their length, for logs.
+func brief(_ message: [String: Any]) -> [String: Any] {
+    message.mapValues { value -> Any in
+        if let text = value as? String, text.count > 200 { return "<\(text.count) chars>" }
+        return value
+    }
+}
+
 var outSeq = 0
 func send(_ message: [String: Any]) {
     outSeq += 1
+    if selfTest {
+        print("[send] \(brief(message))")
+        return
+    }
     guard let plain = try? JSONSerialization.data(withJSONObject: message),
           let sealed = try? AES.GCM.seal(plain, using: key,
                                          authenticating: Data("imochige1|\(sessionID)|r2c|\(outSeq)".utf8)),
@@ -529,6 +544,186 @@ func uuLogin() -> [String: Any] {
     return result
 }
 
+// MARK: - UU one-click: QR login + allow same-account control
+// Verified on macos-15 and macos-15-intel by the uu-probe workflow: UU's widgets are exposed
+// through Accessibility with exact screen geometry, so every click below targets an AX frame
+// (no OCR guessing). Settings > 安全 has a row "允许同账号控制本设备" with an AXButton toggle.
+
+func axFrame(_ node: AXUIElement) -> CGRect? {
+    guard let p = attribute(node, kAXPositionAttribute), let s = attribute(node, kAXSizeAttribute) else { return nil }
+    var point = CGPoint.zero, size = CGSize.zero
+    AXValueGetValue(p as! AXValue, .cgPoint, &point)
+    AXValueGetValue(s as! AXValue, .cgSize, &size)
+    return CGRect(origin: point, size: size)
+}
+
+func axLabel(_ node: AXUIElement) -> String {
+    [kAXTitleAttribute, kAXValueAttribute, kAXDescriptionAttribute].map { string(node, $0) }.first { !$0.isEmpty } ?? ""
+}
+
+func uuWindowNodes(_ app: NSRunningApplication) -> [AXUIElement] {
+    attribute(AXUIElementCreateApplication(app.processIdentifier), kAXWindowsAttribute) as? [AXUIElement] ?? []
+}
+
+/// First element in UU's windows whose label (spaces removed) contains `text`.
+func uuFind(_ app: NSRunningApplication, _ text: String, role wanted: String? = nil, in window: AXUIElement? = nil,
+            exact: Bool = false) -> AXUIElement? {
+    for win in window.map({ [$0] }) ?? uuWindowNodes(app) {
+        if let hit = descendants(win, limit: 1500).first(where: { node in
+            let label = axLabel(node).replacingOccurrences(of: " ", with: "")
+            return (exact ? label == text : label.contains(text)) && (wanted == nil || role(node) == wanted)
+        }) { return hit }
+    }
+    return nil
+}
+
+func clickNode(_ node: AXUIElement) -> Bool {
+    guard let f = axFrame(node), f.width > 0, f.height > 0 else { return false }
+    postClick(CGPoint(x: f.midX, y: f.midY))
+    return true
+}
+
+func waitFor(_ seconds: Double, _ condition: () -> Bool) -> Bool {
+    let end = Date().addingTimeInterval(seconds)
+    while Date() < end { if condition() { return true }; pump(0.5) }
+    return condition()
+}
+
+func captureRegion(_ rect: CGRect, maxSide: Int = 700) -> Data? {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("imochige-r-\(UUID().uuidString)")
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let raw = dir.appendingPathComponent("r.png").path
+    let region = "\(Int(rect.minX)),\(Int(rect.minY)),\(Int(rect.width)),\(Int(rect.height))"
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+    p.arguments = ["-x", "-R", region, raw]
+    p.standardError = FileHandle.nullDevice
+    do { try p.run(); p.waitUntilExit() } catch { return nil }
+    return FileManager.default.contents(atPath: raw)
+}
+
+/// The login window shows "扫码登录" and a ~158 pt square AXImage holding the QR code.
+func uuQRNode(_ app: NSRunningApplication) -> AXUIElement? {
+    for win in uuWindowNodes(app) where uuFind(app, "扫码登录", in: win) != nil {
+        if let image = descendants(win, limit: 1500).first(where: { node in
+            guard role(node) == kAXImageRole as String, let f = axFrame(node) else { return false }
+            return f.width >= 100 && f.width <= 320 && abs(f.width - f.height) < 4
+        }) { return image }
+    }
+    return nil
+}
+
+/// The toggle on the same row as `labelText` (an AXButton with a 0/1 value).
+func uuToggle(_ app: NSRunningApplication, row labelText: String) -> AXUIElement? {
+    guard let label = uuFind(app, labelText, role: kAXStaticTextRole as String), let lf = axFrame(label),
+          let settings = uuWindowNodes(app).first(where: { string($0, kAXTitleAttribute) == "设置" }) else { return nil }
+    return descendants(settings, limit: 1500).first { node in
+        guard role(node) == kAXButtonRole as String, attribute(node, kAXValueAttribute) is NSNumber,
+              let f = axFrame(node) else { return false }
+        return abs(f.midY - lf.midY) < 12
+    }
+}
+
+func toggleValue(_ node: AXUIElement) -> Int { (attribute(node, kAXValueAttribute) as? NSNumber)?.intValue ?? -1 }
+
+func uuAuto() -> [String: Any] {
+    func progress(_ text: String) { print("[uu_auto] \(text)"); send(["type": "uu_progress", "text": text]) }
+    let front = bringUUToFront()
+    guard let app = uuApp() else { return front }
+
+    if let tip = uuFind(app, "知道了", role: kAXButtonRole as String) {
+        AXUIElementPerformAction(tip, kAXPressAction as CFString)
+        pump(0.8)
+    }
+
+    // 1) Sign in to UU by QR code (skipped when already signed in).
+    if let login = uuFind(app, "立即登录") {
+        progress("正在打开 UU 登录二维码…")
+        guard clickNode(login), waitFor(15, { uuQRNode(app) != nil }) else {
+            return ["ok": false, "step": "qr", "error": "UU login window with a QR code did not appear"]
+        }
+        pump(1)
+        var lastQR = Data()
+        let loginWait = Double(env["IMOCHIGE_LOGIN_WAIT"] ?? "") ?? 240
+        let signedIn = waitFor(loginWait) {
+            if let qr = uuQRNode(app), let f = axFrame(qr), let data = captureRegion(f.insetBy(dx: -8, dy: -8)), data != lastQR {
+                lastQR = data
+                send(["type": "uu_qr", "png": data.base64EncodedString()])
+            }
+            pump(2)
+            return uuQRNode(app) == nil && uuFind(app, "立即登录") == nil
+        }
+        guard signedIn else { return ["ok": false, "step": "login", "error": "Timed out waiting for the QR scan (4 minutes)"] }
+        progress("UU 已登录，正在打开「允许同账号控制本设备」…")
+        pump(2)
+    } else {
+        progress("UU 已是登录状态，正在打开「允许同账号控制本设备」…")
+    }
+
+    return uuAllowControl(app)
+}
+
+/// Settings > 安全 > 允许同账号控制本设备 (turns it on and reads it back).
+func uuAllowControl(_ app: NSRunningApplication) -> [String: Any] {
+    _ = bringUUToFront()
+    let menuBar = attribute(AXUIElementCreateApplication(app.processIdentifier), kAXMenuBarAttribute)
+    let settingsItem = menuBar.flatMap { bar in
+        descendants(bar as! AXUIElement, limit: 400).first {
+            role($0) == kAXMenuItemRole as String && string($0, kAXTitleAttribute).hasPrefix("设置")
+        }
+    }
+    if let settingsItem { AXUIElementPerformAction(settingsItem, kAXPressAction as CFString) }
+    guard waitFor(8, { uuWindowNodes(app).contains { string($0, kAXTitleAttribute) == "设置" } }) else {
+        return ["ok": false, "step": "settings", "error": "UU settings window did not open"]
+    }
+    // The settings window opens behind UU's main window (seen in the self-test screenshot): raise it first.
+    func raiseSettings() {
+        if let win = uuWindowNodes(app).first(where: { string($0, kAXTitleAttribute) == "设置" }) {
+            AXUIElementSetAttributeValue(win, kAXMainAttribute as CFString, kCFBooleanTrue)
+            AXUIElementPerformAction(win, kAXRaiseAction as CFString)
+            pump(0.6)
+        }
+    }
+    raiseSettings()
+    guard let tab = uuFind(app, "安全", role: kAXStaticTextRole as String, exact: true), clickNode(tab),
+          waitFor(5, { uuToggle(app, row: "允许同账号控制本设备") != nil }),
+          let toggle = uuToggle(app, row: "允许同账号控制本设备") else {
+        return ["ok": false, "step": "security", "error": "Could not find the 允许同账号控制本设备 switch"]
+    }
+    func isOn() -> Bool { (uuToggle(app, row: "允许同账号控制本设备").map(toggleValue) ?? 0) == 1 }
+    if toggleValue(toggle) != 1 {
+        raiseSettings()
+        _ = clickNode(toggle)
+        if !waitFor(3, isOn) {
+            // Not signed in: UU answers with "登录网易UU远程 / 登录后可允许同账户远控本机" (seen in the self-test).
+            if uuFind(app, "登录后可允许同账户远控本机") != nil {
+                if let cancel = uuFind(app, "取消", role: kAXButtonRole as String, exact: true) {
+                    AXUIElementPerformAction(cancel, kAXPressAction as CFString)
+                }
+                return ["ok": false, "step": "security", "needs_login": true,
+                        "error": "UU is not signed in, so the switch cannot be turned on yet"]
+            }
+            // Signed in: accept a confirmation dialog if UU shows one.
+            for title in ["确定", "开启", "立即开启", "允许", "同意", "确认"] {
+                if let button = uuFind(app, title, role: kAXButtonRole as String, exact: true) {
+                    AXUIElementPerformAction(button, kAXPressAction as CFString)
+                    if waitFor(3, isOn) { break }
+                }
+            }
+        }
+    }
+    let final = uuToggle(app, row: "允许同账号控制本设备").map(toggleValue) ?? -1
+    // Capture the settings window as proof, including the permission warning if UU shows one.
+    let settingsWindow = uuWindowNodes(app).first { string($0, kAXTitleAttribute) == "设置" }
+    let proof = settingsWindow.flatMap(axFrame).flatMap { captureRegion($0) }
+    let warning = uuFind(app, "系统权限未完整配置").map(axLabel) ?? ""
+    var result: [String: Any] = ["ok": final == 1, "step": "done", "allowed": final == 1, "warning": warning]
+    if let proof { result["png"] = proof.base64EncodedString() }
+    if final != 1 { result["error"] = "The switch did not turn on (value \(final))" }
+    return result
+}
+
 // MARK: - UU remote view (click on the picture to click on the Mac)
 
 func postClick(_ point: CGPoint) {
@@ -617,6 +812,21 @@ func uuCommand(_ op: String, _ command: [String: Any]) -> [String: Any] {
 
 // MARK: - Main loop
 
+if selfTest {
+    print("[selftest] AX=\(AXIsProcessTrusted()) post=\(CGPreflightPostEventAccess()) screen=\(CGPreflightScreenCaptureAccess())")
+    let auto = uuAuto()
+    print("[selftest] uu_auto -> \(brief(auto))")
+    postKey(kVK_Escape); pump(1)
+    if let app = uuApp() {
+        let allow = uuAllowControl(app)
+        print("[selftest] allow_control -> \(brief(allow))")
+        if let png = allow["png"] as? String, let data = Data(base64Encoded: png), let out = env["OUT"] {
+            try? data.write(to: URL(fileURLWithPath: out).appendingPathComponent("selftest-settings.png"))
+        }
+    }
+    exit(0)
+}
+
 print("Accessibility trusted: \(AXIsProcessTrusted()); event posting: \(CGPreflightPostEventAccess()); screen capture: \(CGPreflightScreenCaptureAccess())")
 send(["type": "hello", "trusted": AXIsProcessTrusted(), "events": CGPreflightPostEventAccess(),
       "screen": CGPreflightScreenCaptureAccess(),
@@ -664,6 +874,8 @@ while running {
                 result = env["UU_APP"] != nil ? bringUUToFront() : ["ok": false, "error": "UU Remote was not installed in this session"]
             case "uu_login":
                 result = uuLogin()
+            case "uu_auto":
+                result = uuAuto()
             case "uu_view", "uu_click", "uu_settings", "uu_key":
                 result = uuCommand(op, command)
             case "snapshot":
